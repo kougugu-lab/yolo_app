@@ -1,0 +1,15 @@
+__pycache__/
+dist/
+runs/
+modules/__pycache__/
+config.json
+Inspection_App_運用マニュアル.pptx
+Inspection_App_設定マニュアル.pptx
+.agents/
+manual/
+modules/labelimg_src/
+*.bat
+*.txt
+*.pt
+*.log
+*.ico
