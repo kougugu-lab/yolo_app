@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -29,7 +30,7 @@ import config_manager
 import operations
 from help_dialog import HelpDialog
 from settings_dialog import SettingsDialog
-from workers import ScriptWorker, SubprocessWorker
+from workers import ScriptWorker, SubprocessWorker, LabelImgWorker
 
 
 class LabelListDialog(QDialog):
@@ -189,7 +190,7 @@ class MainWindow(QMainWindow):
         self.step_buttons = []
         step_defs = [
             ("1. データセット準備 (フォルダ作成 & 画像コピー)", self._step_prepare_dataset),
-            ("2. ラベル設定",                  self._step_set_labels),
+            ("2. クラス名設定",                self._step_set_labels),
             ("3. 自動アノテーション (モデルがある場合のみ)", self._step_auto_label),
         ]
         for text, slot in step_defs:
@@ -466,46 +467,47 @@ class MainWindow(QMainWindow):
             self._log_err(f"コピー失敗: {e}")
             return
 
-        self._log_ok("準備完了！ 次に「2. ラベル設定」を行ってください。")
+        self._log_ok("準備完了！ 次に「2. クラス名設定」を行ってください。")
 
     # ==================================================================
-    # Step 2: ラベル設定
+    # Step 2: クラス名設定
     # ==================================================================
     def _step_set_labels(self):
         if not self._require("dataset_dir"):
             return
-        self._log_header("ラベル設定")
+        self._log_header("クラス名設定")
 
-        current = self.config.get("class_names", "")
-        if current:
-            initial_text = "\n".join(n.strip() for n in current.split(",") if n.strip())
-        else:
-            cls_file = Path(self.config["dataset_dir"]) / "classes.txt"
-            if cls_file.exists():
-                initial_text = cls_file.read_text(encoding="utf-8").strip()
+        try:
+            current = self.config.get("class_names", "")
+            if current:
+                initial_text = "\n".join(n.strip() for n in current.split(",") if n.strip())
             else:
-                initial_text = ""
+                cls_file = Path(self.config["dataset_dir"]) / "classes.txt"
+                initial_text = operations.read_text_safe(cls_file).strip()
 
-        dlg = _MultiLineInputDialog(
-            title="ラベル設定",
-            label="クラス名を1行に1つずつ入力 (classes.txt 形式):",
-            text=initial_text,
-            parent=self,
-        )
-        if dlg.exec():
-            text = dlg.get_text().strip()
-            if text:
-                names = [n.strip() for n in text.splitlines() if n.strip()]
-                path = operations.save_classes(self.config["dataset_dir"], names)
-                self.config["class_names"] = ",".join(names)
-                config_manager.save(self.config)
-                self._log_ok(f"{len(names)} クラスを保存 → classes.txt (ルート / train / val)")
-                for i, n in enumerate(names):
-                    self._log_info(f"  {i}: {n}")
+            dlg = _MultiLineInputDialog(
+                title="クラス名設定",
+                label="クラス名を1行に1つずつ入力 (classes.txt 形式):",
+                text=initial_text,
+                parent=self,
+            )
+            if dlg.exec():
+                text = dlg.get_text().strip()
+                if text:
+                    names = [n.strip() for n in text.splitlines() if n.strip()]
+                    path = operations.save_classes(self.config["dataset_dir"], names)
+                    self.config["class_names"] = ",".join(names)
+                    config_manager.save(self.config)
+                    self._log_ok(f"{len(names)} クラスを保存 → classes.txt (ルート / train / val)")
+                    for i, n in enumerate(names):
+                        self._log_info(f"  {i}: {n}")
+                else:
+                    self._log_info("入力が空です")
             else:
-                self._log_info("入力が空です")
-        else:
-            self._log_info("キャンセルされました")
+                self._log_info("キャンセルされました")
+        except Exception as e:
+            self._log_err(f"クラス名設定処理中にエラーが発生しました: {e}")
+            QMessageBox.critical(self, "エラー", f"クラス名設定処理でエラーが発生しました:\n{e}")
 
     # ==================================================================
     # Step 4: アノテーション (Train / Val)
@@ -545,36 +547,26 @@ class MainWindow(QMainWindow):
             self._log_err(f"{split} フォルダが見つかりません: {image_dir}")
             return
         if not classes_file.exists():
-            self._log_err("classes.txt が見つかりません。先に「ラベル設定」を実行してください。")
+            self._log_err("classes.txt が見つかりません。先に「クラス名設定」を実行してください。")
             return
 
-        # Determine the command to launch labelImg based on whether the app is bundled (frozen)
-        if getattr(sys, 'frozen', False):
-            # In EXE mode, sys.executable is the app itself
-            cmd = [
-                sys.executable,
-                "--labelImg",
-                str(image_dir),
-                str(classes_file),
-                str(image_dir),
-            ]
-        else:
-            # In script mode, we launch main.py with the --labelImg flag
-            main_py = Path(__file__).parent / "main.py"
-            cmd = [
-                sys.executable,
-                str(main_py),
-                "--labelImg",
-                str(image_dir),
-                str(classes_file),
-                str(image_dir),
-            ]
+        # labelImg は PyQt5 を使用しているため、PyQt6 の main.py とは
+        # 別プロセスとして直接 labelImg.py を実行する必要がある。
+        # 同一プロセス内で両方のバインディングをロードするとクラッシュする。
+        labelimg_script = Path(__file__).parent / "labelimg_src" / "labelImg.py"
+        py_exe = self.config.get("python_path") or sys.executable
+        cmd = [
+            str(py_exe),
+            str(labelimg_script),
+            str(image_dir),
+            str(classes_file),
+            str(image_dir),
+        ]
         self._log_info(f"  対象フォルダ: {image_dir}")
         self._log_info(f"  クラスファイル: {classes_file}")
         try:
-            # labelImg は GUI アプリなので shell=False, 標準出力をパイプしない
-            self.worker = SubprocessWorker(cmd, stdout_log=False)
-            self.worker.log_signal.connect(self._log_info)
+            # labelImg は GUI アプリなので stdout_log=False, CREATE_NO_WINDOW は使わない
+            self.worker = LabelImgWorker(cmd)
             self.worker.finished_signal.connect(
                 lambda ok, msg: self._on_labelimg_done(ok, msg, split)
             )

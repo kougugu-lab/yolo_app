@@ -27,6 +27,15 @@ from styles import DARK_THEME_QSS
 
 
 def main():
+    if sys.platform == "win32":
+        try:
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            if hasattr(sys.stderr, "reconfigure"):
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     _trace("main:start")
     parser = argparse.ArgumentParser(description="YOLOv8 Manager")
     parser.add_argument("--labelImg", action="store_true", help="Launch bundled labelImg")

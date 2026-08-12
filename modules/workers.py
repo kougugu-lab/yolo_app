@@ -77,6 +77,49 @@ class SubprocessWorker(QThread):
         self._is_cancelled = True
 
 
+
+class LabelImgWorker(QThread):
+    """labelImg (PyQt5 GUI) を独立プロセスとして起動し終了を監視するワーカー。
+    CREATE_NO_WINDOW を使わずウィンドウが正常に表示されるようにする。
+    """
+
+    finished_signal = pyqtSignal(bool, str)  # (成功フラグ, メッセージ)
+
+    def __init__(self, command: list, parent=None):
+        super().__init__(parent)
+        self.command = command
+        self._process = None
+
+    def run(self):
+        try:
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+            # labelImg は PyQt5 ベースの GUI アプリのため、CREATE_NO_WINDOW を
+            # 指定してはいけない（ウィンドウが非表示になり 0xC0000409 クラッシュが発生）
+            self._process = subprocess.Popen(
+                self.command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            self._process.wait()
+            rc = self._process.returncode
+            if rc == 0:
+                self.finished_signal.emit(True, "正常に完了しました")
+            else:
+                self.finished_signal.emit(False, f"終了コード: {rc}")
+        except Exception as e:
+            self.finished_signal.emit(False, f"エラー: {e}")
+
+    def cancel(self):
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.terminate()
+            except OSError:
+                pass
+
+
 class ScriptWorker(QThread):
     """Python スクリプト文字列を仮想環境で実行するワーカー。
     operations.py の build_*_script() と連携する。"""

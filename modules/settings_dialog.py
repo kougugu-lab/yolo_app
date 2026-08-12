@@ -22,12 +22,66 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QVBoxLayout,
     QWidget,
-    QPlainTextEdit,
 )
 
 import config_manager
 import operations
-from workers import InstallWorker, ScriptWorker, check_packages
+from workers import InstallWorker, check_packages
+
+
+class CollapsibleGroupBox(QWidget):
+    """クリックして開閉できる折りたたみ式グループコンテナ"""
+
+    def __init__(self, title: str, parent=None, is_expanded: bool = False):
+        super().__init__(parent)
+        self._is_expanded = is_expanded
+        self._title_text = title
+
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 4, 0, 4)
+        self.main_layout.setSpacing(0)
+
+        # ヘッダーボタン
+        self.toggle_btn = QPushButton()
+        self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; font-weight: bold; font-size: 13px; "
+            "padding: 8px 12px; background-color: #2b2b2b; color: #e0e0e0; "
+            "border: 1px solid #3c3c3c; border-radius: 6px; } "
+            "QPushButton:hover { background-color: #383838; border-color: #555555; }"
+        )
+        self.toggle_btn.clicked.connect(self.toggle_expanded)
+        self.main_layout.addWidget(self.toggle_btn)
+
+        # コンテンツ表示用エリア
+        self.content_area = QWidget()
+        self.content_area.setObjectName("CollapsibleContent")
+        self.content_area.setStyleSheet(
+            "QWidget#CollapsibleContent { background-color: #1e1e1e; border: 1px solid #3c3c3c; "
+            "border-top: none; border-bottom-left-radius: 6px; border-bottom-right-radius: 6px; }"
+        )
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.main_layout.addWidget(self.content_area)
+        self._update_state()
+
+    def toggle_expanded(self):
+        self._is_expanded = not self._is_expanded
+        self._update_state()
+
+    def _update_state(self):
+        arrow = "▼" if self._is_expanded else "▶"
+        self.toggle_btn.setText(f"{arrow}  {self._title_text}")
+        self.content_area.setVisible(self._is_expanded)
+        self.updateGeometry()
+        if self.parentWidget():
+            self.parentWidget().updateGeometry()
+
+    def setContentLayout(self, layout):
+        container = QWidget()
+        container.setLayout(layout)
+        self.content_layout.addWidget(container)
 
 
 class SettingsDialog(QDialog):
@@ -89,7 +143,7 @@ class SettingsDialog(QDialog):
         root.addWidget(path_group)
 
         # --- データ分割 ---
-        split_group = QGroupBox("データ分割 (画像コピー時に使用)")
+        split_group = QGroupBox("データ分割")
         split_layout = QFormLayout()
         self.train_spin = QSpinBox()
         self.train_spin.setRange(1, 99999)
@@ -103,18 +157,13 @@ class SettingsDialog(QDialog):
         split_group.setLayout(split_layout)
         root.addWidget(split_group)
 
-        # --- ハイパーパラメータ (学習時に使用) ---
-        hp_group = QGroupBox("ハイパーパラメータ (学習設定)")
+        # --- ハイパーパラメータ ---
+        hp_group = QGroupBox("ハイパーパラメータ")
         hp_layout = QFormLayout()
         self.epochs_spin = QSpinBox()
         self.epochs_spin.setRange(1, 9999)
         self.epochs_spin.setToolTip("学習を何回繰り返すか指定します。回数が多いほど賢くなりますが時間がかかります。")
         hp_layout.addRow("学習回数 (Epochs):", self.epochs_spin)
-        
-        self.batch_spin = QSpinBox()
-        self.batch_spin.setRange(1, 512)
-        self.batch_spin.setToolTip("一度に処理する画像の枚数です。PCの性能(GPUメモリ)に合わせて調整します。")
-        hp_layout.addRow("バッチサイズ (Batch):", self.batch_spin)
         
         self.imgsz_spin = QSpinBox()
         self.imgsz_spin.setRange(32, 4096)
@@ -122,14 +171,9 @@ class SettingsDialog(QDialog):
         self.imgsz_spin.setToolTip("学習・推論時の画像サイズ。通常は 640 を使用します。")
         hp_layout.addRow("画像サイズ (Image Size):", self.imgsz_spin)
         
-        self.workers_spin = QSpinBox()
-        self.workers_spin.setRange(0, 32)
-        self.workers_spin.setToolTip("データの読み込みに使用する並列数です。通常は 4 程度でOKです。")
-        hp_layout.addRow("並列数 (Workers):", self.workers_spin)
-        
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["n", "s", "m", "l", "x"])
-        self.model_combo.setToolTip("学習のベースにするモデルサイズ。n(極小)からx(特大)まであり、大きいほど高精度ですが重くなります。")
+        self.model_combo.addItems(["n", "s", "m", "l", "x", "n-p2", "s-p2", "m-p2", "l-p2", "x-p2"])
+        self.model_combo.setToolTip("学習のベースにするモデルサイズ。P2ヘッダー付きモデル(n-p2〜x-p2)も選択可能です。")
         hp_layout.addRow("ベースモデル:", self.model_combo)
 
         self.yolo_version_combo = QComboBox()
@@ -140,8 +184,8 @@ class SettingsDialog(QDialog):
         hp_group.setLayout(hp_layout)
         root.addWidget(hp_group)
 
-        # --- オーギュメント設定 (データ拡張) ---
-        aug_group = QGroupBox("オーギュメント設定 (データ拡張)")
+        # --- オーギュメント設定 [折りたたみコンテナ] ---
+        aug_group = CollapsibleGroupBox("オーギュメント設定", is_expanded=False)
         aug_layout = QFormLayout()
 
         # HSV-H
@@ -224,11 +268,11 @@ class SettingsDialog(QDialog):
         self.fliplr_spin.setToolTip("左右反転の適用確率 (0.0〜1.0)")
         aug_layout.addRow("左右反転 (fliplr):", self.fliplr_spin)
 
-        aug_group.setLayout(aug_layout)
+        aug_group.setContentLayout(aug_layout)
         root.addWidget(aug_group)
 
         # --- 推論設定 ---
-        inf_group = QGroupBox("推論/自動アノテーション設定")
+        inf_group = QGroupBox("推論・自動アノテーション設定")
         inf_layout = QHBoxLayout()
         inf_label = QLabel("信頼度閾値 (Conf):")
         inf_label.setToolTip("AIが「それ」であると確信する度合いの最低ラインです。高いほど誤検知が減ります。")
@@ -259,8 +303,6 @@ class SettingsDialog(QDialog):
         check_btn = QPushButton("パッケージ確認")
         check_btn.clicked.connect(self._check_packages)
         btn_row.addWidget(check_btn)
-
-
 
         reset_btn = QPushButton("パラメータリセット")
         reset_btn.clicked.connect(self._reset_params)
@@ -326,9 +368,7 @@ class SettingsDialog(QDialog):
         self.train_spin.setValue(self.config.get("train_count", 80))
         self.val_spin.setValue(self.config.get("val_count", 20))
         self.epochs_spin.setValue(self.config.get("epochs", 100))
-        self.batch_spin.setValue(self.config.get("batch", 16))
         self.imgsz_spin.setValue(self.config.get("imgsz", 640))
-        self.workers_spin.setValue(self.config.get("workers", 4))
         model = self.config.get("base_model", "n")
         idx = self.model_combo.findText(model)
         if idx >= 0:
@@ -356,6 +396,7 @@ class SettingsDialog(QDialog):
         self.fliplr_spin.setValue(float(self.config.get("fliplr", 0.5)))
 
     def _collect_values(self) -> dict:
+        imgsz_val = self.imgsz_spin.value()
         return {
             "python_path": self.python_edit.text().strip(),
             "dataset_dir": self.dataset_edit.text().strip(),
@@ -364,9 +405,9 @@ class SettingsDialog(QDialog):
             "train_count": self.train_spin.value(),
             "val_count": self.val_spin.value(),
             "epochs": self.epochs_spin.value(),
-            "batch": self.batch_spin.value(),
-            "imgsz": self.imgsz_spin.value(),
-            "workers": self.workers_spin.value(),
+            "batch": -1,
+            "imgsz": imgsz_val,
+            "workers": operations.get_auto_workers(imgsz_val),
             "base_model": self.model_combo.currentText(),
             "yolo_version": self.yolo_version_combo.currentText(),
             "conf_threshold": self.conf_slider.value() / 100.0,
@@ -427,17 +468,15 @@ class SettingsDialog(QDialog):
     def _on_install_done(self, success: bool, message: str):
         if success:
             QMessageBox.information(self, "完了", message)
-
         else:
             QMessageBox.warning(self, "エラー", message)
-
 
     def _show_settings_help(self):
         """設定項目の詳しい解説ダイアログを表示"""
         help_msg = """
 <h1 style="color:#82aaff;">設定項目の解説</h1>
 
-<h3 style="color:#c3e88d;">パス設定 (重要)</h3>
+<h3 style="color:#c3e88d;">パス設定</h3>
 <p><b>■ データセット保存先:</b><br>
 学習用データや成果物が保存されるメインフォルダです。新プロジェクトごとに空のフォルダを作るのが推奨です。</p>
 <p><b>■ 自動アノテーション用モデル:</b><br>
@@ -447,27 +486,24 @@ AIに自動ラベル付けをさせたい時に使用する既存のモデル（
 <p><b>■ Python 実行パス:</b><br>
 AIを動かすためのエンジンの場所を指定します。基本的には初期設定のままで問題ありません。</p>
 
-<h3 style="color:#c3e88d;">データ分割設定</h3>
+<h3 style="color:#c3e88d;">データ分割</h3>
 <p><b>■ 学習用枚数 / 検証用枚数:</b><br>
 元画像から何枚を「学習用」と「検証用」に割り振るかを決めます。ステップ1で指定した枚数分、ランダムにコピーを行います。<br>
 一般的に 8(練習):2(テスト) 程度の比率が良いとされています。</p>
 
-<h3 style="color:#c3e88d;">学習設定 (ステップ5で使用)</h3>
+<h3 style="color:#c3e88d;">ハイパーパラメータ</h3>
 <p><b>■ 学習回数 (Epochs):</b><br>
 データを何回繰り返し学習させるかです。50〜200 程度が目安です。</p>
-<p><b>■ バッチサイズ (Batch):</b><br>
-一度に記憶する画像の枚数です。PCが重い・エラーが出る場合は 2 や 4 に数値を下げてください。</p>
 <p><b>■ 画像サイズ (Image Size):</b><br>
 AIが画像を読み込む解像度です。通常は 640 です。高いと精度が上がりますが動作は遅くなります。</p>
-<p><b>■ 並列数 (Workers):</b><br>
-データの読み込みを並列で行う数です。標準は 4 です。</p>
+<p>※バッチサイズは自動バッチ(-1)、並列数は画像サイズに応じて最適な値が自動設定されます。</p>
 <p><b>■ ベースモデル:</b><br>
 学習の土台となるモデルの「規模」です。n(最速) < s < m < l < x(最高精度) の順で、右ほど賢いですが重くなります。</p>
 <p><b>■ YOLO バージョン:</b><br>
 使用するAIの世代です。最新の 11 が最もお勧めです。</p>
 
-<h3 style="color:#c3e88d;">オーギュメント設定 (データ拡張の詳細)</h3>
-<p>画像枚数が少ない場合や、実際の撮影環境の変動に対応させるためのリアルタイム画像加工パラメータです。</p>
+<h3 style="color:#c3e88d;">オーギュメント設定</h3>
+<p>画像枚数が少ない場合や、実際の撮影環境の変動に対応させるためのリアルタイム画像加工パラメータです。ヘッダーをクリックすると詳細が展開されます。</p>
 <p><b>■ 色相変化 (hsv_h: 0.0〜1.0):</b><br>
 画像の色合いをランダムに変化させます。照明の色変化に対する耐性を高めます。（初期値: 0.015）</p>
 <p><b>■ 彩度変化 (hsv_s: 0.0〜1.0):</b><br>
@@ -489,7 +525,7 @@ AIが画像を読み込む解像度です。通常は 640 です。高いと精�
 <p><b>■ 左右反転 (fliplr: 0.0〜1.0):</b><br>
 左右を反転させる確率です。鏡映しでも同じ対象の場合は 0.5 程度が有効です。（初期値: 0.5）</p>
 
-<h3 style="color:#c3e88d;">推論設定</h3>
+<h3 style="color:#c3e88d;">推論・自動アノテーション設定</h3>
 <p><b>■ 信頼度閾値 (Conf):</b><br>
 AIが「自信がある」と判断する基準です。0.4〜0.5 程度が使いやすい設定です。</p>
 """

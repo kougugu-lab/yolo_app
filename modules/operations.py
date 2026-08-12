@@ -4,7 +4,7 @@
 import random
 import shutil
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Union
 
 import yaml
 
@@ -15,6 +15,21 @@ def _safe(path: str) -> str:
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+
+
+def get_auto_workers(imgsz: int) -> int:
+    """RTX 5060 前提の imgsz に連動した並列数 (workers) 自動決定ロジック。
+    - imgsz <= 640  : workers = 4
+    - imgsz <= 800  : workers = 2
+    - imgsz > 800   : workers = 0 (1024 など)
+    """
+    if imgsz <= 640:
+        return 4
+    elif imgsz <= 800:
+        return 2
+    else:
+        return 0
+
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +87,22 @@ def split_copy(
 # ---------------------------------------------------------------------------
 # 3. ラベル設定
 # ---------------------------------------------------------------------------
+def read_text_safe(file_path: Union[str, Path]) -> str:
+    """UTF-8, UTF-8-sig, CP932(Shift-JIS) 等のマルチエンコーディング対応で安全にテキストを読み込む。"""
+    path = Path(file_path)
+    if not path.exists():
+        return ""
+    for enc in ("utf-8", "utf-8-sig", "cp932", "shift_jis"):
+        try:
+            return path.read_text(encoding=enc)
+        except (UnicodeDecodeError, OSError):
+            continue
+    try:
+        return path.read_bytes().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
 def save_classes(dataset_dir: str, class_names: List[str]) -> str:
     """classes.txt をデータセット直下および train/val フォルダに保存。
     ルートのパスを返す。"""
@@ -523,17 +554,34 @@ if __name__ == "__main__":
 # 7. NCNN エクスポートスクリプト
 # ---------------------------------------------------------------------------
 def build_ncnn_export_script(model_path: str, imgsz: int) -> str:
-    """NCNN 形式にモデルをエクスポートするスクリプト文字列を返す。"""
+    """NCNN 形式にモデルをエクスポートし、作成されたフォルダの末尾に .ncnn を付与するスクリプト文字列を返す。"""
     s_model = _safe(model_path)
     return f'''# -*- coding: utf-8 -*-
 import multiprocessing
 multiprocessing.freeze_support()
 
+import os
+import shutil
+from pathlib import Path
 from ultralytics import YOLO
 
 def main():
     model = YOLO("{s_model}")
-    model.export(format="ncnn", imgsz={imgsz})
+    out = model.export(format="ncnn", imgsz={imgsz})
+    if out:
+        out_path = Path(out)
+        if out_path.exists():
+            if not out_path.name.endswith(".ncnn"):
+                new_path = out_path.with_name(out_path.name + ".ncnn")
+                if new_path.exists():
+                    if new_path.is_dir():
+                        shutil.rmtree(new_path)
+                    else:
+                        new_path.unlink()
+                out_path.rename(new_path)
+                print(f"NCNN model saved to: {{new_path}}")
+            else:
+                print(f"NCNN model saved to: {{out_path}}")
 
 if __name__ == "__main__":
     main()

@@ -26,9 +26,9 @@ DEFAULTS = {
     "val_count": 20,
     # ハイパーパラメータ
     "epochs": 100,
-    "batch": 4,
+    "batch": -1,
     "imgsz": 640,
-    "workers": 0,
+    "workers": 4,
     "base_model": "n",          # n / s / m / l / x
     "yolo_version": "11",       # 8 / 11
     # 推論設定
