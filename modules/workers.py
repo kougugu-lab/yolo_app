@@ -10,6 +10,48 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
 
+def _read_process_output_realtime(read_pipe, process, log_signal, is_cancelled_fn, encoding="utf-8"):
+    """\\r (tqdm 進捗など) と \\n の両方に対応したバイナリリアルタイム読み込みルーチン"""
+    if not read_pipe:
+        return
+    buffer = bytearray()
+    while True:
+        if is_cancelled_fn():
+            return
+        b = read_pipe.read(1)
+        if not b:
+            if process.poll() is not None:
+                break
+            continue
+        if b in (b'\r', b'\n'):
+            if buffer:
+                try:
+                    line = buffer.decode(encoding, errors="replace").strip()
+                except Exception:
+                    line = buffer.decode("cp932", errors="replace").strip()
+                buffer.clear()
+                if line:
+                    log_signal.emit(line)
+        else:
+            buffer.extend(b)
+            if len(buffer) > 2048:
+                try:
+                    line = buffer.decode(encoding, errors="replace").strip()
+                except Exception:
+                    line = buffer.decode("cp932", errors="replace").strip()
+                buffer.clear()
+                if line:
+                    log_signal.emit(line)
+
+    if buffer:
+        try:
+            line = buffer.decode(encoding, errors="replace").strip()
+        except Exception:
+            line = buffer.decode("cp932", errors="replace").strip()
+        if line:
+            log_signal.emit(line)
+
+
 class SubprocessWorker(QThread):
     """任意のコマンドを subprocess で実行し、stdout/stderr をリアルタイム配信。"""
 
@@ -29,10 +71,10 @@ class SubprocessWorker(QThread):
             if self.stdout_log:
                 self.log_signal.emit(f"[CMD] {' '.join(self.command)}")
             self.progress_signal.emit(0)
-            # Windows ではシステムエンコーディング（cp932等）が使われることが多いため調整
             encoding = "utf-8"
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
 
             if self.stdout_log:
                 stdout_target = subprocess.PIPE
@@ -41,40 +83,44 @@ class SubprocessWorker(QThread):
                 stdout_target = subprocess.DEVNULL # 標準出力は捨てる
                 stderr_target = subprocess.PIPE    # エラー出力のみ
 
-            process = subprocess.Popen(
+            self._process = subprocess.Popen(
                 self.command,
                 stdout=stdout_target,
                 stderr=stderr_target,
-                text=True,
-                encoding=encoding,
-                errors="replace",
                 cwd=self.cwd,
                 env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
             
-            # 出力読み取りルーチン (stdout_target が PIPE の場合は stdout を、そうでない場合は stderr を読む)
-            read_pipe = process.stdout if self.stdout_log else process.stderr
-            
-            if read_pipe:
-                for line in iter(read_pipe.readline, ""):
-                    if self._is_cancelled:
-                        process.terminate()
-                        self.finished_signal.emit(False, "キャンセルされました")
-                        return
-                    self.log_signal.emit(line.rstrip())
+            # 出力読み取りルーチン (\\r と \\n 両対応のバイナリ即時配信)
+            read_pipe = self._process.stdout if self.stdout_log else self._process.stderr
+            _read_process_output_realtime(read_pipe, self._process, self.log_signal, lambda: self._is_cancelled, encoding=encoding)
                     
-            process.wait()
-            if process.returncode == 0:
+            self._process.wait()
+            if self._is_cancelled:
+                self.finished_signal.emit(False, "キャンセルされました")
+            elif self._process.returncode == 0:
                 self.progress_signal.emit(100)
                 self.finished_signal.emit(True, "正常に完了しました")
             else:
-                self.finished_signal.emit(False, f"終了コード: {process.returncode}")
+                self.finished_signal.emit(False, f"終了コード: {self._process.returncode}")
         except Exception as e:
             self.finished_signal.emit(False, f"エラー: {e}")
 
     def cancel(self):
         self._is_cancelled = True
+        if hasattr(self, "_process") and self._process and self._process.poll() is None:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                else:
+                    self._process.terminate()
+            except Exception:
+                pass
 
 
 
@@ -149,29 +195,24 @@ class ScriptWorker(QThread):
             encoding = "utf-8"
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
 
-            process = subprocess.Popen(
-                [self.python_path, tmp_file.name],
+            self._process = subprocess.Popen(
+                [self.python_path, "-u", tmp_file.name],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding=encoding,
-                errors="replace",
                 env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
-            for line in iter(process.stdout.readline, ""):
-                if self._is_cancelled:
-                    process.terminate()
-                    self.finished_signal.emit(False, "キャンセルされました")
-                    return
-                self.log_signal.emit(line.rstrip())
-            process.wait()
-            if process.returncode == 0:
+            _read_process_output_realtime(self._process.stdout, self._process, self.log_signal, lambda: self._is_cancelled, encoding=encoding)
+            self._process.wait()
+            if self._is_cancelled:
+                self.finished_signal.emit(False, "キャンセルされました")
+            elif self._process.returncode == 0:
                 self.progress_signal.emit(100)
                 self.finished_signal.emit(True, "正常に完了しました")
             else:
-                self.finished_signal.emit(False, f"終了コード: {process.returncode}")
+                self.finished_signal.emit(False, f"終了コード: {self._process.returncode}")
         except Exception as e:
             self.finished_signal.emit(False, f"エラー: {e}")
         finally:
@@ -183,6 +224,18 @@ class ScriptWorker(QThread):
 
     def cancel(self):
         self._is_cancelled = True
+        if hasattr(self, "_process") and self._process and self._process.poll() is None:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                else:
+                    self._process.terminate()
+            except Exception:
+                pass
 
 
 class InstallWorker(QThread):
@@ -256,3 +309,46 @@ def check_packages(python_path: str, packages: list) -> list:
         except Exception:
             missing.append(pkg)
     return missing
+
+
+class CopyWorker(QThread):
+    """画像分割コピーをバックグラウンド実行し進捗を通知するワーカー"""
+
+    progress_signal = pyqtSignal(int, int, str)  # (copied_count, total_count, filename)
+    finished_signal = pyqtSignal(bool, dict, str)  # (success, result_dict, error_msg)
+
+    def __init__(self, source_dir: str, dataset_dir: str, train_count: int, val_count: int, parent=None):
+        super().__init__(parent)
+        self.source_dir = source_dir
+        self.dataset_dir = dataset_dir
+        self.train_count = train_count
+        self.val_count = val_count
+        self._is_cancelled = False
+
+    def run(self):
+        try:
+            import operations
+
+            def on_progress(current, total, filename):
+                self.progress_signal.emit(current, total, filename)
+
+            def is_cancel():
+                return self._is_cancelled
+
+            result = operations.split_copy(
+                self.source_dir,
+                self.dataset_dir,
+                self.train_count,
+                self.val_count,
+                progress_callback=on_progress,
+                cancel_check=is_cancel,
+            )
+            if self._is_cancelled:
+                self.finished_signal.emit(False, {}, "キャンセルされました")
+            else:
+                self.finished_signal.emit(True, result, "")
+        except Exception as e:
+            self.finished_signal.emit(False, {}, str(e))
+
+    def cancel(self):
+        self._is_cancelled = True

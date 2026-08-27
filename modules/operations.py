@@ -1,8 +1,7 @@
-# -*- coding: utf-8 -*-
-"""各ステップのコアロジック（pathlib 使用で Windows 対応）"""
-
+import os
 import random
 import shutil
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -54,6 +53,8 @@ def split_copy(
     dataset_dir: str,
     train_count: int,
     val_count: int,
+    progress_callback=None,
+    cancel_check=None,
 ) -> dict:
     """元画像からランダム抽出し、train/val フォルダへコピーする。"""
     src = Path(source_dir)
@@ -76,12 +77,26 @@ def split_copy(
     train_dst.mkdir(parents=True, exist_ok=True)
     val_dst.mkdir(parents=True, exist_ok=True)
 
-    for f in train_files:
-        shutil.copy2(str(f), str(train_dst / f.name))
-    for f in val_files:
-        shutil.copy2(str(f), str(val_dst / f.name))
+    copied_count = 0
+    total_files = len(train_files) + len(val_files)
 
-    return {"train": len(train_files), "val": len(val_files), "total": len(all_images)}
+    for f in train_files:
+        if cancel_check and cancel_check():
+            raise InterruptedError("処理が中断されました")
+        shutil.copy2(str(f), str(train_dst / f.name))
+        copied_count += 1
+        if progress_callback:
+            progress_callback(copied_count, total_files, f.name)
+
+    for f in val_files:
+        if cancel_check and cancel_check():
+            raise InterruptedError("処理が中断されました")
+        shutil.copy2(str(f), str(val_dst / f.name))
+        copied_count += 1
+        if progress_callback:
+            progress_callback(copied_count, total_files, f.name)
+
+    return {"train": len(train_files), "val": len(val_files), "total": total_files}
 
 
 # ---------------------------------------------------------------------------
@@ -249,29 +264,88 @@ def build_train_script(
 
     return f'''# -*- coding: utf-8 -*-
 import multiprocessing
+import gc
+import torch
+
 multiprocessing.freeze_support()
 
 from ultralytics import YOLO
 
 def main():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
     model = YOLO("{model_name}")
-    results = model.train(
-        data="{s_data}",
-        epochs={epochs},
-        batch={batch},
-        imgsz={imgsz},
-        workers={workers},
-        hsv_h={hsv_h},
-        hsv_s={hsv_s},
-        hsv_v={hsv_v},
-        degrees={degrees},
-        translate={translate},
-        scale={scale},
-        shear={shear},
-        perspective={perspective},
-        flipud={flipud},
-        fliplr={fliplr},
-    )
+    try:
+        results = model.train(
+            data="{s_data}",
+            epochs={epochs},
+            batch={batch},
+            imgsz={imgsz},
+            workers={workers},
+            hsv_h={hsv_h},
+            hsv_s={hsv_s},
+            hsv_v={hsv_v},
+            degrees={degrees},
+            translate={translate},
+            scale={scale},
+            shear={shear},
+            perspective={perspective},
+            flipud={flipud},
+            fliplr={fliplr},
+        )
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "out of memory" in err_msg or "cuda" in err_msg:
+            print("[WARNING] CUDA Out of Memory (VRAM不足) が発生しました。")
+            print("[INFO] VRAMを完全解放し、安全バッチサイズ (batch=4) で自動リトライを開始します...")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            try:
+                results = model.train(
+                    data="{s_data}",
+                    epochs={epochs},
+                    batch=4,
+                    imgsz={imgsz},
+                    workers={workers},
+                    hsv_h={hsv_h},
+                    hsv_s={hsv_s},
+                    hsv_v={hsv_v},
+                    degrees={degrees},
+                    translate={translate},
+                    scale={scale},
+                    shear={shear},
+                    perspective={perspective},
+                    flipud={flipud},
+                    fliplr={fliplr},
+                )
+            except Exception as e2:
+                print("[INFO] VRAMを完全解放し、極小バッチサイズ (batch=2) で最終リトライを開始します...")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                results = model.train(
+                    data="{s_data}",
+                    epochs={epochs},
+                    batch=2,
+                    imgsz={imgsz},
+                    workers=0,
+                    hsv_h={hsv_h},
+                    hsv_s={hsv_s},
+                    hsv_v={hsv_v},
+                    degrees={degrees},
+                    translate={translate},
+                    scale={scale},
+                    shear={shear},
+                    perspective={perspective},
+                    flipud={flipud},
+                    fliplr={fliplr},
+                )
+        else:
+            raise e
+
     print("Training complete")
 
 if __name__ == "__main__":
@@ -586,5 +660,150 @@ def main():
 if __name__ == "__main__":
     main()
 '''
+
+
+# ---------------------------------------------------------------------------
+# 8. 未アノテーション画像に対する空ラベルファイルの自動作成
+# ---------------------------------------------------------------------------
+def create_empty_labels(dataset_dir: Union[str, Path]) -> int:
+    """train / val フォルダ内の未アノテーション画像（対応する .txt が存在しない画像）に対して空の .txt ファイルを作成する。
+    戻り値: 作成した空ラベルファイル数
+    """
+    base = Path(dataset_dir)
+    if not base.exists():
+        return 0
+
+    created_count = 0
+    # 通常の dataset/{train,val} または dataset/images/{train,val} の両方に対応
+    target_dirs = []
+    for split in ["train", "val"]:
+        # 1. dataset/train, dataset/val
+        d1 = base / split
+        if d1.is_dir():
+            target_dirs.append((d1, d1))
+        # 2. dataset/images/train, dataset/labels/train
+        img_d = base / "images" / split
+        lbl_d = base / "labels" / split
+        if img_d.is_dir():
+            lbl_d.mkdir(parents=True, exist_ok=True)
+            target_dirs.append((img_d, lbl_d))
+
+    for img_dir, lbl_dir in target_dirs:
+        for img_file in img_dir.iterdir():
+            if img_file.is_file() and img_file.suffix.lower() in IMAGE_EXTENSIONS:
+                txt_file = lbl_dir / f"{img_file.stem}.txt"
+                if not txt_file.exists():
+                    txt_file.touch()  # 空ファイル作成
+                    created_count += 1
+
+    return created_count
+
+
+# ---------------------------------------------------------------------------
+# 9. デスクトップ起動ショートカットの作成 (OS自動判定)
+# ---------------------------------------------------------------------------
+def create_desktop_shortcut(python_path: str = "") -> dict:
+    """デスクトップ上に 'YOLOマネージャー' の起動ショートカット/スクリプトを作成する。
+    - Windows: 'YOLOマネージャー.bat'
+    - Linux / Raspberry Pi: 'YOLOマネージャー.sh' (chmod 0o755) & 'YOLOマネージャー.desktop'
+    """
+    app_dir = Path(__file__).resolve().parent.parent
+    main_py = app_dir / "modules" / "main.py"
+    
+    # 実行用 python パス
+    py_exec = python_path if python_path and Path(python_path).exists() else sys.executable
+
+    # デスクトップのパスを取得
+    home = Path.home()
+    desktop_dir = home / "Desktop"
+    if not desktop_dir.exists():
+        desktop_jp = home / "デスクトップ"
+        if desktop_jp.exists():
+            desktop_dir = desktop_jp
+        else:
+            desktop_dir.mkdir(parents=True, exist_ok=True)
+
+    is_windows = sys.platform == "win32"
+
+    if is_windows:
+        bat_file = desktop_dir / "YOLOマネージャー.bat"
+        content = (
+            f"@echo off\n"
+            f"chcp 65001 > nul\n"
+            f"cd /d \"{app_dir}\"\n"
+            f"\"{py_exec}\" \"{main_py}\"\n"
+            f"if errorlevel 1 pause\n"
+        )
+        bat_file.write_text(content, encoding="utf-8")
+        return {
+            "success": True,
+            "path": str(bat_file),
+            "type": "bat",
+            "message": f"Windows用実行ファイル ({bat_file.name}) をデスクトップに作成しました。",
+        }
+    else:
+        # Linux / Raspberry Pi (.sh のみ作成、ターミナルウィンドウを表示)
+        sh_file = desktop_dir / "YOLOマネージャー.sh"
+        sh_content = (
+            f"#!/bin/bash\n"
+            f"# ターミナル環境でない場合（デスクトップダブルクリックなど）はターミナルを起動して自身を実行\n"
+            f"if [ ! -t 0 ] && [ -z \"$ALREADY_IN_TERMINAL\" ]; then\n"
+            f"    export ALREADY_IN_TERMINAL=1\n"
+            f"    for term in lxterminal x-terminal-emulator gnome-terminal xterm konsole; do\n"
+            f"        if command -v $term >/dev/null 2>&1; then\n"
+            f"            exec $term -e \"$0\" \"$@\"\n"
+            f"        fi\n"
+            f"    done\n"
+            f"fi\n\n"
+            f"cd \"{app_dir}\"\n"
+            f"\"{py_exec}\" \"{main_py}\"\n\n"
+            f"echo ''\n"
+            f"read -p \"処理が終了しました。Enterキーを押すと閉じます...\"\n"
+        )
+        sh_file.write_text(sh_content, encoding="utf-8")
+        try:
+            sh_file.chmod(0o755)
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "path": str(sh_file),
+            "type": "sh",
+            "message": f"Linux/Raspberry Pi用実行スクリプト ({sh_file.name}) をデスクトップに作成しました。",
+        }
+
+
+# ---------------------------------------------------------------------------
+# 10. Raspberry Pi 環境判定
+# ---------------------------------------------------------------------------
+def is_raspberry_pi() -> bool:
+    """現在の実行環境が Raspberry Pi (または ARM SBC) かどうかを判定する。"""
+    try:
+        model_path = Path("/proc/device-tree/model")
+        if model_path.exists():
+            model_text = model_path.read_text(encoding="utf-8", errors="ignore").lower()
+            if "raspberry pi" in model_text or "rpi" in model_text:
+                return True
+    except Exception:
+        pass
+
+    try:
+        for p in ["/etc/rpi-issue", "/etc/os-release"]:
+            f = Path(p)
+            if f.exists():
+                content = f.read_text(encoding="utf-8", errors="ignore").lower()
+                if "raspberry pi" in content or "raspbian" in content:
+                    return True
+    except Exception:
+        pass
+
+    if sys.platform.startswith("linux"):
+        import platform
+        mach = platform.machine().lower()
+        if "arm" in mach or "aarch64" in mach:
+            return True
+
+    return False
 
 

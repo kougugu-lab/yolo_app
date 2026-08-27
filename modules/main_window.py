@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -30,7 +29,7 @@ import config_manager
 import operations
 from help_dialog import HelpDialog
 from settings_dialog import SettingsDialog
-from workers import ScriptWorker, SubprocessWorker, LabelImgWorker
+from workers import ScriptWorker, SubprocessWorker, LabelImgWorker, CopyWorker
 
 
 class LabelListDialog(QDialog):
@@ -145,6 +144,8 @@ class MainWindow(QMainWindow):
         self.config = config_manager.load()
         self._worker = None
         self._last_log_was_progress = False
+        self._last_copy_logged_pct = -1
+        self._is_rpi = operations.is_raspberry_pi()
         self.setWindowTitle("YOLO Manager")
         self.setMinimumSize(1020, 640)
         self.resize(1100, 750)
@@ -229,26 +230,26 @@ class MainWindow(QMainWindow):
         self.step_buttons.extend([train_btn, val_btn, list_btn])
 
         # 残りのステップ
-        rest_defs = [
-            ("5. 学習実行",                    self._step_train),
-            ("6. 推論",                        self._step_inference_excel),
-        ]
-        for text, slot in rest_defs:
-            btn = QPushButton(f"  {text}")
-            btn.setProperty("step", True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(slot)
-            steps_layout.addWidget(btn)
-            self.step_buttons.append(btn)
+        self.train_step_btn = QPushButton("  5. 学習実行")
+        self.train_step_btn.setProperty("step", True)
+        self.train_step_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.train_step_btn.clicked.connect(self._step_train)
+        if self._is_rpi:
+            self.train_step_btn.setEnabled(False)
+            self.train_step_btn.setToolTip("Raspberry Pi 環境上でのモデル学習は非対応です（PC等で学習を行ってください）。")
+            self.train_step_btn.setText("  5. 学習実行 (RPI非対応)")
+        steps_layout.addWidget(self.train_step_btn)
+        self.step_buttons.append(self.train_step_btn)
+
+        infer_btn = QPushButton("  6. 推論")
+        infer_btn.setProperty("step", True)
+        infer_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        infer_btn.clicked.connect(self._step_inference_excel)
+        steps_layout.addWidget(infer_btn)
+        self.step_buttons.append(infer_btn)
 
         steps_group.setLayout(steps_layout)
         left_layout.addWidget(steps_group)
-
-        # プログレスバー
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        self.progress.setTextVisible(True)
-        left_layout.addWidget(self.progress)
 
         left_layout.addStretch()
 
@@ -266,9 +267,20 @@ class MainWindow(QMainWindow):
         self.log_area.setReadOnly(True)
         right_layout.addWidget(self.log_area)
 
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        self.stop_btn = QPushButton("動作停止")
+        self.stop_btn.setObjectName("stopButton")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_current_task)
+        btn_layout.addWidget(self.stop_btn)
+
         clear_btn = QPushButton("ログクリア")
         clear_btn.clicked.connect(self.log_area.clear)
-        right_layout.addWidget(clear_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        btn_layout.addWidget(clear_btn)
+
+        right_layout.addLayout(btn_layout)
 
         splitter.addWidget(left)
         splitter.addWidget(right)
@@ -288,26 +300,66 @@ class MainWindow(QMainWindow):
         clean_text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', clean_text)
         clean_text = re.sub(r'\[[0-9]+;?[0-9]*m', '', clean_text)
 
-        # NCNN / PNNX エクスポート等のデバッグ・ノイズログをフィルタリング
+        # デバッグ・ノイズ・自動出力される不要な内部ログをフィルタリング
         ncnn_ignore_keywords = [
             "inline module", "pnnx", "ncnnparam", "ncnnbin", "ncnnpy",
             "fp16 =", "optlevel =", "device =", "inputshape", "customop =",
             "moduleop =", "#############", "----------------", "Predict:",
             "Validate:", "Visualize:", "get inputshape", "Ultralytics",
             "summary (fused)", "PyTorch:", "NCNN:", "Export complete",
-            "Results saved to", "NCNNモデルへ変換中", "NCNNモデルの変換が完了しました"
+            "Results saved to", "NCNNモデルへ変換中", "NCNNモデルの変換が完了しました",
+            "pip install -U ultralytics", "available  Update with", "available Update with",
+            "engine\\trainer:", "engine/trainer:", "engine\\", "engine/", "Overriding model.yaml",
+            "Overriding ", "from  n    params", "from n params", "ultralytics.nn.modules",
+            "torch.nn.modules", "summary:", "items from pretrained weights",
+            "Transferred ", "Freezing layer", "AMP: running", "AMP: checks passed",
+            "Params      GFLOPs  GPU_mem", "forward (ms)", "backward (ms)",
+            ")                    list", "(800, 800)"
         ]
         if any(kw in clean_text for kw in ncnn_ignore_keywords):
             return
+
+        # ログメッセージの日本語化変換
+        m_cache = re.match(r'^(train|val):\s+New cache created:\s+(.*)$', clean_text, re.IGNORECASE)
+        if m_cache:
+            split_type = "学習用" if m_cache.group(1).lower() == "train" else "検証用"
+            clean_text = f"  [INFO] {split_type}キャッシュを作成しました: {m_cache.group(2)}"
+
+        m_plot = re.match(r'^Plotting labels to\s+(.*)$', clean_text, re.IGNORECASE)
+        if m_plot:
+            clean_text = f"  [INFO] ラベル分布画像を保存しました: {m_plot.group(1)}"
+
+        m_autobatch = re.search(r'AutoBatch:\s+Computing', clean_text, re.IGNORECASE)
+        if m_autobatch:
+            clean_text = "  [INFO] 最適なバッチサイズを自動計算中..."
+
+        m_start = re.match(r'^Starting training for (\d+) epochs\.\.\.', clean_text, re.IGNORECASE)
+        if m_start:
+            clean_text = f"  [INFO] 学習を開始します (全 {m_start.group(1)} エポック)..."
+
+        m_logto = re.match(r'^Logging results to\s+(.*)$', clean_text, re.IGNORECASE)
+        if m_logto:
+            clean_text = f"  [INFO] 学習結果保存先: {m_logto.group(1)}"
+
+        m_scan = re.search(r'(train|val):\s+Scanning', clean_text, re.IGNORECASE)
+        is_scan_log = False
+        if m_scan:
+            is_scan_log = True
+            split_type = "学習用" if m_scan.group(1).lower() == "train" else "検証用"
+            m_scan_pct = re.search(r'(\d{1,3}%|\d+/\d+)', clean_text)
+            pct_info = f" {m_scan_pct.group(1)}" if m_scan_pct else ""
+            clean_text = f"  [INFO] {split_type}データセットをスキャン中...{pct_info}"
 
         # 完了メッセージ・要約ログ・エラーログ・ヘッダーなどは絶対に進捗表示とみなさない
         non_progress_keywords = [
             "Excel", "結果画像", "処理画像数", "Saved", "Total", "[OK]", "[NG]",
             "[CMD]", "[SCRIPT]", "完了", "モデル", "対象", "結果ファイル", "保存先",
-            "=", "枚を処理中", "完了しました", "アノテーション"
+            "=", "枚を処理中", "完了しました", "アノテーション", "Instances", "box_loss"
         ]
 
-        if any(kw in clean_text for kw in non_progress_keywords):
+        if is_scan_log:
+            is_progress = True
+        elif any(kw in clean_text for kw in non_progress_keywords):
             is_progress = False
         else:
             progress_keywords = ["%", "it/s", "s/it", "Epoch", "Inference", "推論進捗", "train:", "val:", "Predicting"]
@@ -345,7 +397,7 @@ class MainWindow(QMainWindow):
 
     def _log_info(self, msg: str):
         self._last_log_was_progress = False
-        self._log(f"  {msg}")
+        self._log(f"  [INFO] {msg}")
 
     # ==================================================================
     # 設定 / ヘルプ
@@ -388,29 +440,47 @@ class MainWindow(QMainWindow):
     # ワーカー管理
     # ==================================================================
     def _set_busy(self, busy: bool):
-        self.progress.setVisible(busy)
-        if busy:
-            self.progress.setValue(0)
         for btn in self.step_buttons:
-            btn.setEnabled(not busy)
+            if self._is_rpi and btn is self.train_step_btn:
+                btn.setEnabled(False)
+            else:
+                btn.setEnabled(not busy)
+        self.stop_btn.setEnabled(busy)
+
+    def _stop_current_task(self):
+        """実行中のタスクを強制停止する"""
+        if self._worker and self._worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "動作停止",
+                "現在実行中の処理を停止しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._log_info("ユーザー要求により動作停止を実行中...")
+                self.stop_btn.setEnabled(False)
+                self._worker.cancel()
 
     def _start_worker(self, worker):
         if self._worker and self._worker.isRunning():
             QMessageBox.warning(self, "実行中", "別の処理が実行中です。完了をお待ちください。")
             return
         self._worker = worker
-        worker.log_signal.connect(self._log)
-        worker.progress_signal.connect(self.progress.setValue)
+        if hasattr(worker, "log_signal"):
+            worker.log_signal.connect(self._log)
         worker.finished_signal.connect(self._on_worker_done)
         self._set_busy(True)
         worker.start()
 
-    def _on_worker_done(self, success: bool, message: str):
-        self._set_busy(False)
+    def _on_worker_done(self, success: bool, message: str = ""):
         if success:
-            self._log_ok(message)
+            if message:
+                self._log_ok(message)
         else:
-            self._log_err(message)
+            if message:
+                self._log_err(message)
+        self._set_busy(False)
 
     # ==================================================================
     # YAML 自動生成ヘルパー
@@ -455,19 +525,34 @@ class MainWindow(QMainWindow):
         # 画像コピー処理
         self._log_info(f"元画像フォルダ: {source_dir}")
         self._log_info("画像を分割コピー中...")
-        try:
-            copied = operations.split_copy(
-                source_dir,
-                self.config["dataset_dir"],
-                self.config.get("train_count", 80),
-                self.config.get("val_count", 20),
-            )
-            self._log_ok(f"計 {copied['total']} 枚のコピーが完了しました (学習:{copied['train']}, 検証:{copied['val']})")
-        except Exception as e:
-            self._log_err(f"コピー失敗: {e}")
-            return
 
-        self._log_ok("準備完了！ 次に「2. クラス名設定」を行ってください。")
+        self._last_copy_logged_pct = -1
+
+        worker = CopyWorker(
+            source_dir,
+            self.config["dataset_dir"],
+            self.config.get("train_count", 80),
+            self.config.get("val_count", 20),
+            parent=self,
+        )
+        worker.progress_signal.connect(self._on_copy_progress)
+        worker.finished_signal.connect(self._on_copy_done)
+        self._start_worker(worker)
+
+    def _on_copy_progress(self, current: int, total: int, filename: str):
+        pct = int(current / total * 100) if total > 0 else 0
+
+        # 5% ごと、または最初と最後にログ出力（ログの過剰出力を防止しつつ見やすく表示）
+        if pct != self._last_copy_logged_pct and (pct % 5 == 0 or current == total or current == 1):
+            self._last_copy_logged_pct = pct
+            self._log_info(f"コピー中: {current} / {total} 枚 ({pct}%) - {filename}")
+
+    def _on_copy_done(self, success: bool, result: dict, error_msg: str):
+        if success:
+            self._log_ok(f"計 {result.get('total', 0)} 枚のコピーが完了しました (学習:{result.get('train', 0)}, 検証:{result.get('val', 0)})")
+            self._log_ok("準備完了！ 次に「2. クラス名設定」を行ってください。")
+        else:
+            self._log_err(f"コピー失敗: {error_msg}")
 
     # ==================================================================
     # Step 2: クラス名設定
@@ -639,12 +724,24 @@ class MainWindow(QMainWindow):
     # Step 5: 学習実行
     # ==================================================================
     def _step_train(self):
+        if self._is_rpi:
+            QMessageBox.warning(
+                self,
+                "非対応環境",
+                "Raspberry Pi 環境上でのモデル学習はサポートされていません。\nPCなどのGPU環境で学習を実行してください。",
+            )
+            return
         if not self._require("python_path", "dataset_dir"):
             return
         self._log_header("学習実行")
 
         # 学習直前に YAML を自動生成・更新
         self._auto_create_yaml()
+
+        # 未アノテーション画像に対する空ラベルファイルの自動作成
+        empty_created = operations.create_empty_labels(self.config["dataset_dir"])
+        if empty_created > 0:
+            self._log_info(f"未アノテーション画像に対して空のラベルファイル (.txt) を {empty_created} 件自動作成しました")
 
         data_yaml = Path(self.config["dataset_dir"]) / "data.yaml"
         if not data_yaml.exists():

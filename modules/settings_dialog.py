@@ -170,7 +170,12 @@ class SettingsDialog(QDialog):
         self.imgsz_spin.setSingleStep(32)
         self.imgsz_spin.setToolTip("学習・推論時の画像サイズ。通常は 640 を使用します。")
         hp_layout.addRow("画像サイズ (Image Size):", self.imgsz_spin)
-        
+
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(0, 32)
+        self.workers_spin.setToolTip("データ読み込みの並列処理ワーカー数。0〜8が推奨です（RTX 5060等の環境でimgsz=640なら4、800なら2、1024なら0を推奨）。")
+        hp_layout.addRow("並列数 (workers):", self.workers_spin)
+
         self.model_combo = QComboBox()
         self.model_combo.addItems(["n", "s", "m", "l", "x", "n-p2", "s-p2", "m-p2", "l-p2", "x-p2"])
         self.model_combo.setToolTip("学習のベースにするモデルサイズ。P2ヘッダー付きモデル(n-p2〜x-p2)も選択可能です。")
@@ -308,6 +313,11 @@ class SettingsDialog(QDialog):
         reset_btn.clicked.connect(self._reset_params)
         btn_row.addWidget(reset_btn)
 
+        shortcut_btn = QPushButton("ショートカット作成")
+        shortcut_btn.setToolTip("デスクトップにアプリ起動用ショートカット（YOLOマネージャー）を作成します。")
+        shortcut_btn.clicked.connect(self._create_shortcut)
+        btn_row.addWidget(shortcut_btn)
+
         help_btn = QPushButton("ヘルプ")
         help_btn.clicked.connect(self._show_settings_help)
         btn_row.addWidget(help_btn)
@@ -369,6 +379,7 @@ class SettingsDialog(QDialog):
         self.val_spin.setValue(self.config.get("val_count", 20))
         self.epochs_spin.setValue(self.config.get("epochs", 100))
         self.imgsz_spin.setValue(self.config.get("imgsz", 640))
+        self.workers_spin.setValue(self.config.get("workers", 4))
         model = self.config.get("base_model", "n")
         idx = self.model_combo.findText(model)
         if idx >= 0:
@@ -407,7 +418,7 @@ class SettingsDialog(QDialog):
             "epochs": self.epochs_spin.value(),
             "batch": -1,
             "imgsz": imgsz_val,
-            "workers": operations.get_auto_workers(imgsz_val),
+            "workers": self.workers_spin.value(),
             "base_model": self.model_combo.currentText(),
             "yolo_version": self.yolo_version_combo.currentText(),
             "conf_threshold": self.conf_slider.value() / 100.0,
@@ -548,3 +559,20 @@ AIが「自信がある」と判断する基準です。0.4〜0.5 程度が使�
         lyt.addWidget(btn)
         
         dlg.exec()
+
+    def _create_shortcut(self):
+        """デスクトップに実行ショートカット (YOLOマネージャー) を作成する"""
+        py_path = self.python_edit.text().strip()
+        res = operations.create_desktop_shortcut(py_path)
+        if res.get("success"):
+            QMessageBox.information(
+                self,
+                "ショートカット作成完了",
+                f"{res.get('message')}\n\n作成先:\n{res.get('path')}",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "作成失敗",
+                f"ショートカットの作成に失敗しました:\n{res.get('message', '')}",
+            )

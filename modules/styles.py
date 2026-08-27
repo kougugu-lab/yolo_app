@@ -72,6 +72,25 @@ QPushButton[accent="true"]:pressed {
     background-color: #005fa3;
 }
 
+/* ===== 停止ボタン (objectName: stopButton) ===== */
+QPushButton#stopButton {
+    background-color: #8b0000;
+    color: #ffffff;
+    border: 1px solid #a00000;
+    font-weight: bold;
+}
+QPushButton#stopButton:hover {
+    background-color: #a80000;
+}
+QPushButton#stopButton:pressed {
+    background-color: #5c0000;
+}
+QPushButton#stopButton:disabled {
+    background-color: #2d2020;
+    color: #665555;
+    border-color: #3d2d2d;
+}
+
 /* ===== ステップボタン ===== */
 QPushButton[step="true"] {
     background-color: #0078d7;
