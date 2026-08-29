@@ -708,7 +708,7 @@ def create_desktop_shortcut(python_path: str = "") -> dict:
     - Linux / Raspberry Pi: 'YOLOマネージャー.sh' (chmod 0o755) & 'YOLOマネージャー.desktop'
     """
     app_dir = Path(__file__).resolve().parent.parent
-    main_py = app_dir / "modules" / "main.py"
+    main_py = app_dir / "main.py"
     
     # 実行用 python パス
     py_exec = python_path if python_path and Path(python_path).exists() else sys.executable
