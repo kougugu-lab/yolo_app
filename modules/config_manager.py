@@ -17,7 +17,7 @@ else:
 
 DEFAULTS = {
     # パス設定
-    "python_path": "",
+    "python_path": "/usr/bin/python",
     "dataset_dir": "",
     "inference_model_path": "", # 推論 / NCNN 変換用モデル (.pt)
     "autolabel_model_path": "", # オートラベル用モデル (.pt)
