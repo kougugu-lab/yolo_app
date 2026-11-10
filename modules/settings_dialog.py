@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -121,6 +122,7 @@ class SettingsDialog(QDialog):
             path_layout, "データセット保存先:",
             tooltip="学習データ（train/val）や設定ファイルが保存される中心となるフォルダです。"
         )
+        self.dataset_edit.textChanged.connect(self._on_dataset_dir_changed)
         self.autolabel_model_edit = self._path_row(
             path_layout, "自動アノテーション用モデル (.pt):", 
             file_mode=True, 
@@ -276,6 +278,40 @@ class SettingsDialog(QDialog):
         aug_group.setContentLayout(aug_layout)
         root.addWidget(aug_group)
 
+        # --- SAHI / タイル分割設定 [折りたたみコンテナ] ---
+        sahi_group = CollapsibleGroupBox("SAHI / タイル分割設定", is_expanded=False)
+        sahi_layout = QFormLayout()
+
+        # タイル分割学習有効化
+        self.use_tile_train_chk = QCheckBox("タイル分割学習を適用する (SAHI対応)")
+        self.use_tile_train_chk.setToolTip("学習時に高解像度画像をタイル状に分割したデータセットを生成して学習を行います。")
+        sahi_layout.addRow("学習時タイル分割:", self.use_tile_train_chk)
+
+        # タイルサイズ
+        self.tile_size_spin = QSpinBox()
+        self.tile_size_spin.setRange(128, 4096)
+        self.tile_size_spin.setSingleStep(64)
+        self.tile_size_spin.setValue(640)
+        self.tile_size_spin.setToolTip("タイル分割時の1枚あたりの画像サイズ (幅・高さ、通常640)")
+        sahi_layout.addRow("タイルサイズ (px):", self.tile_size_spin)
+
+        # 重なり率
+        self.tile_overlap_spin = QDoubleSpinBox()
+        self.tile_overlap_spin.setRange(0.0, 0.5)
+        self.tile_overlap_spin.setSingleStep(0.05)
+        self.tile_overlap_spin.setDecimals(2)
+        self.tile_overlap_spin.setValue(0.2)
+        self.tile_overlap_spin.setToolTip("隣接するタイル同士の重なり率 (0.0〜0.5、推奨0.2=20%)")
+        sahi_layout.addRow("タイル重なり率 (Overlap):", self.tile_overlap_spin)
+
+        # SAHIスライス推論有効化
+        self.use_sahi_inference_chk = QCheckBox("推論・自動アノテーションでSAHIスライス推論を使用する")
+        self.use_sahi_inference_chk.setToolTip("ステップ6の推論およびステップ3の自動アノテーション時にSAHIスライス推論を使用し、極小物体を高精度に検出します。")
+        sahi_layout.addRow("推論時SAHI適用:", self.use_sahi_inference_chk)
+
+        sahi_group.setContentLayout(sahi_layout)
+        root.addWidget(sahi_group)
+
         # --- 推論設定 ---
         inf_group = QGroupBox("推論・自動アノテーション設定")
         inf_layout = QHBoxLayout()
@@ -406,6 +442,12 @@ class SettingsDialog(QDialog):
         self.flipud_spin.setValue(float(self.config.get("flipud", 0.0)))
         self.fliplr_spin.setValue(float(self.config.get("fliplr", 0.5)))
 
+        # SAHI / タイル分割設定
+        self.use_tile_train_chk.setChecked(bool(self.config.get("use_tile_train", False)))
+        self.tile_size_spin.setValue(int(self.config.get("tile_size", 640)))
+        self.tile_overlap_spin.setValue(float(self.config.get("tile_overlap", 0.2)))
+        self.use_sahi_inference_chk.setChecked(bool(self.config.get("use_sahi_inference", False)))
+
     def _collect_values(self) -> dict:
         imgsz_val = self.imgsz_spin.value()
         return {
@@ -433,7 +475,20 @@ class SettingsDialog(QDialog):
             "perspective": self.perspective_spin.value(),
             "flipud": self.flipud_spin.value(),
             "fliplr": self.fliplr_spin.value(),
+            "use_tile_train": self.use_tile_train_chk.isChecked(),
+            "tile_size": self.tile_size_spin.value(),
+            "tile_overlap": self.tile_overlap_spin.value(),
+            "use_sahi_inference": self.use_sahi_inference_chk.isChecked(),
         }
+
+    def _on_dataset_dir_changed(self, path: str):
+        """データセット保存先変更時に直下の classes.txt を静かに自動読み込み"""
+        path = path.strip()
+        if not path:
+            return
+        classes = operations.read_classes_from_dataset(path)
+        if classes:
+            self.config["class_names"] = ",".join(classes)
 
     # ------------------------------------------------------------------
     # アクション
@@ -453,7 +508,7 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "警告", "有効な Python パスを指定してください。")
             return
 
-        required = ["ultralytics", "pandas", "openpyxl", "labelImg", "PyQt6", "PyYAML", "onnx", "ncnn"]
+        required = ["ultralytics", "pandas", "openpyxl", "labelImg", "PyQt6", "PyYAML", "onnx", "ncnn", "sahi"]
         missing = check_packages(python_path, required)
 
         if not missing:

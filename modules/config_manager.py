@@ -46,6 +46,11 @@ DEFAULTS = {
     "perspective": 0.0,
     "flipud": 0.0,
     "fliplr": 0.5,
+    # SAHI / タイル分割設定
+    "use_tile_train": False,
+    "tile_size": 640,
+    "tile_overlap": 0.2,
+    "use_sahi_inference": False,
 }
 
 

@@ -708,6 +708,9 @@ class MainWindow(QMainWindow):
             self.config["dataset_dir"],
             self.config.get("conf_threshold", 0.25),
             class_names,
+            use_sahi=self.config.get("use_sahi_inference", False),
+            tile_size=self.config.get("tile_size", 640),
+            tile_overlap=self.config.get("tile_overlap", 0.2),
         )
         worker = ScriptWorker(self.config["python_path"], script, parent=self)
         worker.finished_signal.connect(self._on_autolabel_done)
@@ -753,16 +756,40 @@ class MainWindow(QMainWindow):
         if deleted > 0:
             self._log_info(f"キャッシュファイルを {deleted} 件削除しました")
 
-        self._log_info(f"data.yaml : {data_yaml}")
         base_model = self.config.get('base_model', 'n')
         yolo_ver = self.config.get('yolo_version', '11')
         model_pfx = "yolo11" if yolo_ver == "11" else "yolov8"
-        
         self._log_info(f"model     : {model_pfx}{base_model}.pt")
+
+        # タイル分割学習 (SAHI 対応データセット生成)
+        use_tile = self.config.get("use_tile_train", False)
+        self._tile_train_dataset_dir = None  # クリーンアップ用フラグ
+        actual_yaml = data_yaml
+
+        if use_tile:
+            tile_size    = self.config.get("tile_size", 640)
+            tile_overlap = self.config.get("tile_overlap", 0.2)
+            self._log_info(f"タイル分割データセット生成中... (tile={tile_size}, overlap={tile_overlap})")
+            try:
+                result = operations.slice_yolo_dataset(
+                    self.config["dataset_dir"],
+                    tile_size=tile_size,
+                    overlap=tile_overlap,
+                )
+                self._log_info(
+                    f"タイル生成完了 — train: {result['train_count']} 枚, val: {result['val_count']} 枚"
+                )
+                actual_yaml = Path(result["sliced_yaml"])
+                self._tile_train_dataset_dir = self.config["dataset_dir"]
+            except Exception as e:
+                self._log_err(f"タイル生成エラー: {e}")
+                return
+
+        self._log_info(f"data.yaml : {actual_yaml}")
         self._log_info("学習開始...")
 
         script = operations.build_train_script(
-            str(data_yaml),
+            str(actual_yaml),
             self.config.get("epochs", 100),
             self.config.get("batch", 4),
             self.config.get("imgsz", 640),
@@ -776,6 +803,16 @@ class MainWindow(QMainWindow):
         self._start_worker(worker)
 
     def _on_train_done(self, success: bool, message: str):
+        # タイル分割学習の一時フォルダをクリーンアップ
+        tile_dir = getattr(self, "_tile_train_dataset_dir", None)
+        if tile_dir:
+            try:
+                operations.cleanup_sliced_dataset(tile_dir)
+                self._log_info("タイル分割一時フォルダを削除しました")
+            except Exception as e:
+                self._log_info(f"一時フォルダ削除エラー (無視): {e}")
+            self._tile_train_dataset_dir = None
+
         if not success:
             return
 
@@ -853,6 +890,9 @@ class MainWindow(QMainWindow):
             image_dir,
             self.config.get("conf_threshold", 0.25),
             output_xlsx,
+            use_sahi=self.config.get("use_sahi_inference", False),
+            tile_size=self.config.get("tile_size", 640),
+            tile_overlap=self.config.get("tile_overlap", 0.2),
         )
         worker = ScriptWorker(self.config["python_path"], script, parent=self)
         worker.finished_signal.connect(

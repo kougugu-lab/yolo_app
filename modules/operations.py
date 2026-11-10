@@ -118,6 +118,236 @@ def read_text_safe(file_path: Union[str, Path]) -> str:
         return ""
 
 
+def read_classes_from_dataset(dataset_dir: Union[str, Path]) -> List[str]:
+    """dataset_dir 直下に classes.txt があれば読み込んでクラス名リストを返す。存在しない場合は空リスト。"""
+    if not dataset_dir:
+        return []
+    cls_file = Path(dataset_dir) / "classes.txt"
+    if cls_file.exists():
+        raw = read_text_safe(cls_file)
+        return [line.strip() for line in raw.splitlines() if line.strip()]
+    return []
+
+
+def slice_yolo_dataset(
+    dataset_dir: Union[str, Path],
+    tile_size: int = 640,
+    overlap: float = 0.2,
+    bg_ratio: float = 0.5,
+) -> dict:
+    """dataset_dir 配下の train/ と val/ を tile_size×tile_size にスライスし、
+    train_sliced/ と val_sliced/ に保存する。元データは一切変更しない。
+
+    Args:
+        dataset_dir: データセットのルートディレクトリ
+        tile_size:   タイルの一辺のピクセル数
+        overlap:     タイル間のオーバーラップ比率 (0.0〜1.0)
+        bg_ratio:    背景タイル（アノテーションなし）の保存割合 (0.0〜1.0)
+
+    Returns:
+        dict: {
+            "train_sliced": str (パス),
+            "val_sliced":   str (パス),
+            "sliced_yaml":  str (data_sliced.yaml のパス),
+            "train_count":  int (trainタイル数),
+            "val_count":    int (valタイル数),
+        }
+    """
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        raise ImportError("Pillow がインストールされていません。pip install Pillow を実行してください。")
+
+    base = Path(dataset_dir)
+    stride = int(tile_size * (1.0 - overlap))
+    if stride < 1:
+        stride = 1
+
+    counts = {}
+
+    for split in ("train", "val"):
+        src_dir = base / split
+        dst_dir = base / f"{split}_sliced"
+
+        # 出力先をクリア・再作成
+        if dst_dir.exists():
+            shutil.rmtree(dst_dir)
+        dst_dir.mkdir(parents=True)
+
+        tile_count = 0
+
+        if not src_dir.exists():
+            counts[split] = 0
+            continue
+
+        # classes.txt をコピー
+        cls_src = base / "classes.txt"
+        if cls_src.exists():
+            shutil.copy2(cls_src, dst_dir / "classes.txt")
+        else:
+            # train フォルダ内の classes.txt も試みる
+            cls_in_split = src_dir / "classes.txt"
+            if cls_in_split.exists():
+                shutil.copy2(cls_in_split, dst_dir / "classes.txt")
+
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+        images = [p for p in src_dir.iterdir() if p.suffix.lower() in exts]
+
+        for img_path in images:
+            # 対応ラベルファイル読み込み
+            txt_path = src_dir / (img_path.stem + ".txt")
+            boxes = []  # List[List[float]]: [cls_id, cx, cy, w, h] (正規化)
+            if txt_path.exists():
+                raw = read_text_safe(txt_path)
+                for line in raw.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) == 5:
+                        try:
+                            boxes.append([float(p) for p in parts])
+                        except ValueError:
+                            pass
+
+            try:
+                pil_img = PILImage.open(img_path).convert("RGB")
+            except Exception:
+                continue
+
+            img_w, img_h = pil_img.size
+
+            # タイル座標リスト生成
+            xs = list(range(0, max(img_w - tile_size, 0) + 1, stride))
+            ys = list(range(0, max(img_h - tile_size, 0) + 1, stride))
+            # 末端タイルを確実にカバー
+            if not xs or xs[-1] + tile_size < img_w:
+                xs.append(max(img_w - tile_size, 0))
+            if not ys or ys[-1] + tile_size < img_h:
+                ys.append(max(img_h - tile_size, 0))
+
+            tile_idx = 0
+            for y0 in ys:
+                for x0 in xs:
+                    x1 = x0 + tile_size
+                    y1 = y0 + tile_size
+
+                    # タイル内に収まるよう調整
+                    tx0 = max(x0, 0)
+                    ty0 = max(y0, 0)
+                    tx1 = min(x1, img_w)
+                    ty1 = min(y1, img_h)
+                    tw = tx1 - tx0
+                    th = ty1 - ty0
+                    if tw <= 0 or th <= 0:
+                        continue
+
+                    # ボックスをタイル座標に変換
+                    tile_boxes = []
+                    for box in boxes:
+                        cls_id = int(box[0])
+                        # 元画像絶対座標 (ピクセル)
+                        bcx = box[1] * img_w
+                        bcy = box[2] * img_h
+                        bw  = box[3] * img_w
+                        bh  = box[4] * img_h
+                        bx0 = bcx - bw / 2
+                        by0 = bcy - bh / 2
+                        bx1 = bcx + bw / 2
+                        by1 = bcy + bh / 2
+
+                        # タイルとの交差
+                        ix0 = max(bx0, tx0)
+                        iy0 = max(by0, ty0)
+                        ix1 = min(bx1, tx1)
+                        iy1 = min(by1, ty1)
+                        if ix1 <= ix0 or iy1 <= iy0:
+                            continue
+
+                        # 交差面積 ≥ 元ボックス面積の 10% のみ保持
+                        inter_area = (ix1 - ix0) * (iy1 - iy0)
+                        orig_area  = bw * bh
+                        if orig_area <= 0 or inter_area / orig_area < 0.10:
+                            continue
+
+                        # タイル内正規化座標
+                        new_cx = (ix0 + ix1) / 2 - tx0
+                        new_cy = (iy0 + iy1) / 2 - ty0
+                        new_w  = ix1 - ix0
+                        new_h  = iy1 - iy0
+                        tile_boxes.append([
+                            cls_id,
+                            new_cx / tw,
+                            new_cy / th,
+                            new_w  / tw,
+                            new_h  / th,
+                        ])
+
+                    # 保存判定
+                    is_foreground = len(tile_boxes) > 0
+                    if not is_foreground and random.random() > bg_ratio:
+                        continue
+
+                    # タイル画像のクロップと保存
+                    cropped = pil_img.crop((tx0, ty0, tx1, ty1))
+                    # タイルが tile_size より小さい場合はパディング
+                    if tw < tile_size or th < tile_size:
+                        padded = PILImage.new("RGB", (tile_size, tile_size), (114, 114, 114))
+                        padded.paste(cropped, (0, 0))
+                        cropped = padded
+
+                    tile_name = f"{img_path.stem}_tile{tile_idx:04d}"
+                    out_img = dst_dir / f"{tile_name}.jpg"
+                    out_txt = dst_dir / f"{tile_name}.txt"
+
+                    cropped.save(out_img, "JPEG", quality=95)
+
+                    # ラベルファイル保存
+                    with open(out_txt, "w", encoding="utf-8") as f:
+                        for tb in tile_boxes:
+                            f.write(f"{int(tb[0])} {tb[1]:.6f} {tb[2]:.6f} {tb[3]:.6f} {tb[4]:.6f}\n")
+
+                    tile_idx += 1
+                    tile_count += 1
+
+        counts[split] = tile_count
+
+    # data_sliced.yaml を生成
+    train_sliced = str(base / "train_sliced")
+    val_sliced   = str(base / "val_sliced")
+    sliced_yaml  = base / "data_sliced.yaml"
+
+    # クラス名を取得
+    class_names_list = read_classes_from_dataset(base)
+    nc = len(class_names_list)
+    names_yaml = class_names_list if class_names_list else []
+
+    yaml_content = (
+        f"train: {train_sliced}\n"
+        f"val: {val_sliced}\n"
+        f"nc: {nc}\n"
+        f"names: {names_yaml}\n"
+    )
+    sliced_yaml.write_text(yaml_content, encoding="utf-8")
+
+    return {
+        "train_sliced": train_sliced,
+        "val_sliced":   val_sliced,
+        "sliced_yaml":  str(sliced_yaml),
+        "train_count":  counts.get("train", 0),
+        "val_count":    counts.get("val", 0),
+    }
+
+
+def cleanup_sliced_dataset(dataset_dir: Union[str, Path]) -> None:
+    """slice_yolo_dataset() が生成した一時フォルダと YAML を削除する。"""
+    base = Path(dataset_dir)
+    for name in ("train_sliced", "val_sliced"):
+        p = base / name
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+    yaml_p = base / "data_sliced.yaml"
+    if yaml_p.exists():
+        yaml_p.unlink(missing_ok=True)
+
+
 def save_classes(dataset_dir: str, class_names: List[str]) -> str:
     """classes.txt をデータセット直下および train/val フォルダに保存。
     ルートのパスを返す。"""
@@ -361,11 +591,126 @@ def build_inference_script(
     image_dir: str,
     conf: float,
     output_xlsx: str,
+    use_sahi: bool = False,
+    tile_size: int = 640,
+    tile_overlap: float = 0.2,
 ) -> str:
-    """推論 + Excel 出力を行い、結果を個数別フォルダに保存する。"""
+    """推論 + Excel 出力を行い、結果を個数別フォルダに保存する。
+    use_sahi=True の場合は SAHI タイル推論を使用する。"""
     s_model = _safe(model_path)
     s_images = _safe(image_dir)
     s_xlsx = _safe(output_xlsx)
+
+    if use_sahi:
+        return f'''# -*- coding: utf-8 -*-
+import multiprocessing
+multiprocessing.freeze_support()
+
+import cv2
+import numpy as np
+import pandas as pd
+import PIL.Image
+import torch
+from pathlib import Path
+from tqdm import tqdm
+import sys
+import shutil
+
+def main():
+    from sahi import AutoDetectionModel
+    from sahi.predict import get_sliced_prediction
+    from ultralytics.utils.plotting import Annotator, colors
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    detection_model = AutoDetectionModel.from_pretrained(
+        model_type="ultralytics",
+        model_path="{s_model}",
+        confidence_threshold={conf},
+        device=device,
+    )
+
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    image_dir = Path("{s_images}")
+    images = [p for p in image_dir.iterdir() if p.suffix.lower() in exts]
+
+    # 保存用ベースフォルダ
+    save_base = image_dir / "結果画像"
+    if save_base.exists():
+        shutil.rmtree(save_base)
+    save_base.mkdir(parents=True, exist_ok=True)
+
+    print(f"{{len(images)}} 枚を処理中... (SAHI タイル推論 tile={tile_size}, overlap={tile_overlap})")
+    rows = []
+
+    for img_path in tqdm(images, desc="推論進捗", unit="img", file=sys.stdout):
+        fname = img_path.name
+        result = get_sliced_prediction(
+            str(img_path),
+            detection_model,
+            slice_height={tile_size},
+            slice_width={tile_size},
+            overlap_height_ratio={tile_overlap},
+            overlap_width_ratio={tile_overlap},
+            verbose=0,
+        )
+        preds = result.object_prediction_list
+        count = len(preds)
+
+        # 個数別フォルダの作成と保存
+        count_dir = save_base / str(count)
+        count_dir.mkdir(parents=True, exist_ok=True)
+        save_path = count_dir / fname
+
+        # YOLOと同様の描画 (Annotator によるクラス固有色・解像度に応じたフォントサイズ)
+        orig_pil = PIL.Image.open(img_path).convert("RGB")
+        im_cv = cv2.cvtColor(np.array(orig_pil), cv2.COLOR_RGB2BGR)
+        annotator = Annotator(im_cv)
+
+        if count > 0:
+            for pred in preds:
+                cls_id = int(pred.category.id) if pred.category.id is not None else 0
+                cls_name = pred.category.name
+                confidence = round(pred.score.value, 4)
+
+                box = [pred.bbox.minx, pred.bbox.miny, pred.bbox.maxx, pred.bbox.maxy]
+                label_txt = f"{{cls_name}} {{confidence:.2f}}"
+                annotator.box_label(box, label=label_txt, color=colors(cls_id, True))
+
+                rows.append({{
+                    "ファイル名": fname,
+                    "クラス名": cls_name,
+                    "信頼度": confidence,
+                    "検出個数": count,
+                }})
+        else:
+            rows.append({{"ファイル名": fname, "クラス名": "None", "信頼度": 0, "検出個数": 0}})
+
+        # YOLOと同様にRGB変換してPILで保存 (日本語パス対応)
+        res_bgr = annotator.result()
+        res_rgb = cv2.cvtColor(res_bgr, cv2.COLOR_BGR2RGB)
+        PIL.Image.fromarray(res_rgb).save(str(save_path), quality=95)
+
+    df = pd.DataFrame(rows)
+    df.to_excel("{s_xlsx}", index=False, engine="openpyxl")
+
+    # オートフィルター設定
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook("{s_xlsx}")
+        ws = wb.active
+        ws.auto_filter.ref = ws.dimensions
+        wb.save("{s_xlsx}")
+    except Exception:
+        pass
+
+    print(f"\\nExcel出力完了: {s_xlsx}")
+    print(f"結果画像保存先: {{save_base}}")
+    print(f"処理画像数: {{len(images)}}枚, 検出総数: {{len(rows)}}個")
+
+if __name__ == "__main__":
+    main()
+'''
+    # --- 通常推論 (SAHI なし) ---
     return f'''# -*- coding: utf-8 -*-
 import multiprocessing
 multiprocessing.freeze_support()
@@ -428,7 +773,7 @@ def main():
         ws = wb.active
         ws.auto_filter.ref = ws.dimensions
         wb.save("{s_xlsx}")
-    except:
+    except Exception:
         pass
 
     print(f"\\nExcel出力完了: {s_xlsx}")
@@ -519,10 +864,138 @@ def build_autolabel_script(
     dataset_dir: str,
     conf: float,
     class_names: List[str],
+    use_sahi: bool = False,
+    tile_size: int = 640,
+    tile_overlap: float = 0.2,
 ) -> str:
-    """自動アノテーション用の Python スクリプト文字列を返す。"""
+    """自動アノテーション用の Python スクリプト文字列を返す。
+    use_sahi=True の場合は SAHI タイル推論を使用する。"""
     s_model = _safe(model_path)
     s_dataset = _safe(dataset_dir)
+
+    if use_sahi:
+        return f'''# -*- coding: utf-8 -*-
+import multiprocessing
+multiprocessing.freeze_support()
+
+import os
+import sys
+import torch
+import pandas as pd
+from pathlib import Path
+from tqdm import tqdm
+
+def main():
+    from sahi import AutoDetectionModel
+    from sahi.predict import get_sliced_prediction
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    detection_model = AutoDetectionModel.from_pretrained(
+        model_type="ultralytics",
+        model_path="{s_model}",
+        confidence_threshold={conf},
+        device=device,
+    )
+
+    dataset = Path("{s_dataset}")
+    splits = []
+    for split in ["train", "val"]:
+        d = dataset / split
+        if d.exists():
+            splits.append((split, d))
+
+    if not splits:
+        print("ERROR: train または val フォルダが見つかりません")
+        sys.exit(1)
+
+    # classes.txt を各フォルダに作成
+    class_names = detection_model.model.names
+    names_list = [class_names[i] for i in range(len(class_names))]
+    for split, split_dir in splits:
+        cls_file = split_dir / "classes.txt"
+        with open(cls_file, "w", encoding="utf-8") as f:
+            for name in names_list:
+                f.write(name + "\\n")
+
+    excel_rows = []
+    total_images = 0
+
+    for split, split_dir in splits:
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+        images = [p for p in split_dir.iterdir() if p.suffix.lower() in exts]
+        total_images += len(images)
+        print(f"\\n[{{split}}] {{len(images)}} 枚を処理中... (SAHI tile={tile_size}, overlap={tile_overlap})")
+
+        for img_path in tqdm(images, desc=f"  {{split}}", unit="img", file=sys.stdout):
+            fname = img_path.name
+            txt_path = split_dir / (img_path.stem + ".txt")
+
+            result = get_sliced_prediction(
+                str(img_path),
+                detection_model,
+                slice_height={tile_size},
+                slice_width={tile_size},
+                overlap_height_ratio={tile_overlap},
+                overlap_width_ratio={tile_overlap},
+                verbose=0,
+            )
+            preds = result.object_prediction_list
+            count = len(preds)
+
+            if count > 0:
+                # YOLO 形式 (正規化) でラベル保存
+                import PIL.Image
+                img = PIL.Image.open(img_path)
+                img_w, img_h = img.size
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    for pred in preds:
+                        cls_id = pred.category.id
+                        cls_name = pred.category.name
+                        bbox = pred.bbox  # BoundingBox: minx, miny, maxx, maxy
+                        cx = (bbox.minx + bbox.maxx) / 2 / img_w
+                        cy = (bbox.miny + bbox.maxy) / 2 / img_h
+                        w  = (bbox.maxx - bbox.minx) / img_w
+                        h  = (bbox.maxy - bbox.miny) / img_h
+                        f.write(f"{{cls_id}} {{cx:.6f}} {{cy:.6f}} {{w:.6f}} {{h:.6f}}\\n")
+                        conf_val = round(pred.score.value, 4)
+                        excel_rows.append({{
+                            "データ種別": split,
+                            "画像ファイル名": fname,
+                            "クラス名": cls_name,
+                            "信頼度": conf_val,
+                            "検出個数": count,
+                        }})
+            else:
+                txt_path.write_text("", encoding="utf-8")
+                excel_rows.append({{
+                    "データ種別": split,
+                    "画像ファイル名": fname,
+                    "クラス名": "None",
+                    "信頼度": 0,
+                    "検出個数": 0,
+                }})
+
+    xlsx_path = dataset / "autolabel_result.xlsx"
+    df = pd.DataFrame(excel_rows)
+    df.to_excel(str(xlsx_path), index=False, engine="openpyxl")
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(str(xlsx_path))
+        ws = wb.active
+        ws.auto_filter.ref = ws.dimensions
+        wb.save(str(xlsx_path))
+    except Exception:
+        pass
+
+    print(f"\\n=== オートラベリング完了 (SAHI) ===")
+    print(f"  処理画像数: {{total_images}}")
+    print(f"  Excel出力 : {{xlsx_path}}")
+
+if __name__ == "__main__":
+    main()
+'''
+    # --- 通常自動アノテーション (SAHI なし) ---
     return f'''# -*- coding: utf-8 -*-
 import multiprocessing
 multiprocessing.freeze_support()
@@ -612,7 +1085,7 @@ def main():
         ws = wb.active
         ws.auto_filter.ref = ws.dimensions
         wb.save(str(xlsx_path))
-    except:
+    except Exception:
         pass
 
     print(f"\\n=== オートラベリング完了 ===")
