@@ -184,7 +184,7 @@ class SettingsDialog(QDialog):
         hp_layout.addRow("ベースモデル:", self.model_combo)
 
         self.yolo_version_combo = QComboBox()
-        self.yolo_version_combo.addItems(["8", "11"])
+        self.yolo_version_combo.addItems(["8", "11", "26"])
         self.yolo_version_combo.setToolTip("使用する YOLO のバージョンを選択します。")
         hp_layout.addRow("YOLO バージョン:", self.yolo_version_combo)
 
@@ -314,22 +314,38 @@ class SettingsDialog(QDialog):
 
         # --- 推論設定 ---
         inf_group = QGroupBox("推論・自動アノテーション設定")
-        inf_layout = QHBoxLayout()
-        inf_label = QLabel("信頼度閾値 (Conf):")
-        inf_label.setToolTip("AIが「それ」であると確信する度合いの最低ラインです。高いほど誤検知が減ります。")
-        inf_layout.addWidget(inf_label)
-        
+        inf_layout = QFormLayout()
+
+        # 信頼度閾値 (Conf)
+        conf_row = QHBoxLayout()
         self.conf_slider = QSlider(Qt.Orientation.Horizontal)
         self.conf_slider.setRange(1, 100)  # 0.01 ~ 1.00
         self.conf_slider.setTickInterval(5)
-        self.conf_slider.setToolTip("0.01(甘い) 〜 1.00(非常に厳しい) の間で調整します。")
-        self.conf_label = QLabel("0.4")
+        self.conf_slider.setToolTip("AIが「それ」であると確信する度合いの最低ラインです。高いほど誤検知が減ります。")
+        self.conf_label = QLabel("0.25")
         self.conf_label.setMinimumWidth(40)
         self.conf_slider.valueChanged.connect(
             lambda v: self.conf_label.setText(f"{v / 100:.2f}")
         )
-        inf_layout.addWidget(self.conf_slider)
-        inf_layout.addWidget(self.conf_label)
+        conf_row.addWidget(self.conf_slider)
+        conf_row.addWidget(self.conf_label)
+        inf_layout.addRow("信頼度閾値 (Conf):", conf_row)
+
+        # 重なり判定閾値 (IoU)
+        iou_row = QHBoxLayout()
+        self.iou_slider = QSlider(Qt.Orientation.Horizontal)
+        self.iou_slider.setRange(1, 100)  # 0.01 ~ 1.00
+        self.iou_slider.setTickInterval(5)
+        self.iou_slider.setToolTip("重なり判定（NMS/IoU）の閾値です。低いほど重複した検出枠が強力に除去されます（通常0.45〜0.70）。")
+        self.iou_label = QLabel("0.70")
+        self.iou_label.setMinimumWidth(40)
+        self.iou_slider.valueChanged.connect(
+            lambda v: self.iou_label.setText(f"{v / 100:.2f}")
+        )
+        iou_row.addWidget(self.iou_slider)
+        iou_row.addWidget(self.iou_label)
+        inf_layout.addRow("重なり判定閾値 (IoU):", iou_row)
+
         inf_group.setLayout(inf_layout)
         root.addWidget(inf_group)
         
@@ -426,9 +442,13 @@ class SettingsDialog(QDialog):
         if v_idx >= 0:
             self.yolo_version_combo.setCurrentIndex(v_idx)
 
-        conf_int = int(self.config.get("conf_threshold", 0.4) * 100)
+        conf_int = int(self.config.get("conf_threshold", 0.25) * 100)
         self.conf_slider.setValue(max(1, min(100, conf_int)))
         self.conf_label.setText(f"{conf_int / 100:.2f}")
+
+        iou_int = int(self.config.get("iou_threshold", 0.7) * 100)
+        self.iou_slider.setValue(max(1, min(100, iou_int)))
+        self.iou_label.setText(f"{iou_int / 100:.2f}")
 
         # オーギュメントパラメータ
         self.hsv_h_spin.setValue(float(self.config.get("hsv_h", 0.015)))
@@ -463,7 +483,8 @@ class SettingsDialog(QDialog):
             "workers": self.workers_spin.value(),
             "base_model": self.model_combo.currentText(),
             "yolo_version": self.yolo_version_combo.currentText(),
-            "conf_threshold": self.conf_slider.value() / 100.0,
+            "conf_threshold": round(self.conf_slider.value() / 100.0, 2),
+            "iou_threshold": round(self.iou_slider.value() / 100.0, 2),
             "class_names": self.config.get("class_names", ""),
             "hsv_h": self.hsv_h_spin.value(),
             "hsv_s": self.hsv_s_spin.value(),
@@ -566,7 +587,7 @@ AIが画像を読み込む解像度です。通常は 640 です。高いと精�
 <p><b>■ ベースモデル:</b><br>
 学習の土台となるモデルの「規模」です。n(最速) < s < m < l < x(最高精度) の順で、右ほど賢いですが重くなります。</p>
 <p><b>■ YOLO バージョン:</b><br>
-使用するAIの世代です。最新の 11 が最もお勧めです。</p>
+使用するAIの世代です。8、11、26 から選択できます。最新の 26 または 11 がお勧めです。</p>
 
 <h3 style="color:#c3e88d;">オーギュメント設定</h3>
 <p>画像枚数が少ない場合や、実際の撮影環境の変動に対応させるためのリアルタイム画像加工パラメータです。ヘッダーをクリックすると詳細が展開されます。</p>
@@ -593,7 +614,9 @@ AIが画像を読み込む解像度です。通常は 640 です。高いと精�
 
 <h3 style="color:#c3e88d;">推論・自動アノテーション設定</h3>
 <p><b>■ 信頼度閾値 (Conf):</b><br>
-AIが「自信がある」と判断する基準です。0.4〜0.5 程度が使いやすい設定です。</p>
+AIが「自信がある」と判断する基準です。0.25〜0.5 程度が使いやすい設定です。（初期値: 0.25）</p>
+<p><b>■ 重なり判定閾値 (IoU):</b><br>
+重複した検出枠（バウンディングボックス）を1つに統合・除去するための重なり度合い閾値です。低いほど重複枠が強力に除去されます。（初期値: 0.70）</p>
 """
         dlg = QDialog(self)
         dlg.setWindowTitle("設定ヘルプ")

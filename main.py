@@ -2,9 +2,15 @@
 """YOLO Manager v2.0 - エントリーポイント"""
 # EXE化する場合は、直下の `build_app.bat` を実行してください。
 
+import os
 import sys
 import traceback
 from pathlib import Path
+
+# Linux / Raspberry Pi (Wayland環境) における Qt プラットフォームプラグイン警告・エラー対策
+if sys.platform.startswith("linux"):
+    if not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 # modules フォルダをモジュール検索パスに追加
 MODULES_DIR = Path(__file__).parent / "modules"

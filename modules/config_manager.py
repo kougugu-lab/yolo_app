@@ -30,9 +30,10 @@ DEFAULTS = {
     "imgsz": 640,
     "workers": 4,
     "base_model": "n",          # n / s / m / l / x
-    "yolo_version": "11",       # 8 / 11
+    "yolo_version": "26",       # 8 / 11 / 26 (デフォルト: YOLO26n)
     # 推論設定
     "conf_threshold": 0.25,
+    "iou_threshold": 0.7,       # 重なり判定閾値 (IoU: 0.01〜1.00)
     # クラス名 (カンマ区切りで保存)
     "class_names": "",
     # オーギュメント (データ拡張) 設定

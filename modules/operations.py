@@ -1,11 +1,74 @@
 import os
 import random
 import shutil
+import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import yaml
+
+
+def safe_open_path(target_path: Union[str, Path], is_excel: bool = False) -> Tuple[bool, str]:
+    """ファイルまたはフォルダをOS標準のビューア/ファイラーで安全に開く。
+    開けない環境やアプリがない場合は例外を出さずに (False, 案内メッセージ) を返す。
+    開けた場合は (True, 案内メッセージ) を返す。
+    """
+    target = Path(target_path)
+    if not target.exists():
+        return False, f"対象が見つかりません: {target}"
+
+    is_xlsx = is_excel or target.suffix.lower() == ".xlsx"
+    target_str = str(target)
+    type_name = "Excelファイル" if is_xlsx else ("フォルダ" if target.is_dir() else "ファイル")
+
+    if sys.platform == "win32":
+        try:
+            os.startfile(target_str)
+            return True, f"{type_name}を開きました: {target_str}"
+        except Exception:
+            return False, f"{type_name}を開くことができない環境のため、オープンを中止しました（ファイルは正常に作成・保存されています: {target_str}）"
+    else:
+        # Linux / Raspberry Pi / macOS
+        if is_xlsx:
+            viewers = ["libreoffice", "localc", "gnumeric", "wps", "soffice"]
+            has_viewer = any(shutil.which(cmd) for cmd in viewers)
+            xdg = shutil.which("xdg-open")
+
+            has_mime = False
+            if xdg:
+                try:
+                    res = subprocess.run(
+                        ["xdg-mime", "query", "default", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if res.stdout.strip():
+                        has_mime = True
+                except Exception:
+                    pass
+
+            if not has_viewer and not has_mime:
+                return False, f"Excelファイルを開くアプリケーション（LibreOffice等）が見つからない環境のため、オープンを中止しました（ファイルは正常に作成・保存されています: {target_str}）"
+
+            opener = xdg or next((v for v in viewers if shutil.which(v)), None)
+            if not opener:
+                return False, f"Excelファイルを開くアプリケーションが見つからないため、オープンを中止しました（ファイルは正常に作成・保存されています: {target_str}）"
+
+            try:
+                subprocess.Popen([opener, target_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True, f"Excelファイルを開きます: {target_str}"
+            except Exception:
+                return False, f"Excelファイルを開くことができなかったため、オープンを中止しました（ファイルは正常に作成・保存されています: {target_str}）"
+        else:
+            xdg = shutil.which("xdg-open")
+            if xdg:
+                try:
+                    subprocess.Popen([xdg, target_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return True, f"{type_name}を開きます: {target_str}"
+                except Exception:
+                    return False, f"{type_name}を開くことができなかったため、オープンを中止しました（保存先: {target_str}）"
+            else:
+                return False, f"{type_name}を開くコマンド(xdg-open)がないため、オープンを中止しました（保存先: {target_str}）"
 
 
 def _safe(path: str) -> str:
@@ -472,7 +535,9 @@ def build_train_script(
 ) -> str:
     """YOLO 学習用の Python スクリプト文字列を返す。
     freeze_support() 付きで multiprocessing エラーを防止。"""
-    if yolo_version == "11":
+    if str(yolo_version) == "26":
+        model_name = f"yolo26{base_model}.pt"
+    elif str(yolo_version) == "11":
         model_name = f"yolo11{base_model}.pt"
     else:
         model_name = f"yolov8{base_model}.pt"
@@ -594,6 +659,7 @@ def build_inference_script(
     use_sahi: bool = False,
     tile_size: int = 640,
     tile_overlap: float = 0.2,
+    iou: float = 0.7,
 ) -> str:
     """推論 + Excel 出力を行い、結果を個数別フォルダに保存する。
     use_sahi=True の場合は SAHI タイル推論を使用する。"""
@@ -639,7 +705,7 @@ def main():
         shutil.rmtree(save_base)
     save_base.mkdir(parents=True, exist_ok=True)
 
-    print(f"{{len(images)}} 枚を処理中... (SAHI タイル推論 tile={tile_size}, overlap={tile_overlap})")
+    print(f"{{len(images)}} 枚を処理中... (SAHI タイル推論 tile={tile_size}, overlap={tile_overlap}, iou={iou})")
     rows = []
 
     for img_path in tqdm(images, desc="推論進捗", unit="img", file=sys.stdout):
@@ -651,6 +717,9 @@ def main():
             slice_width={tile_size},
             overlap_height_ratio={tile_overlap},
             overlap_width_ratio={tile_overlap},
+            postprocess_type="GREEDYNMM",
+            postprocess_match_metric="IOU",
+            postprocess_match_threshold={iou},
             verbose=0,
         )
         preds = result.object_prediction_list
@@ -734,8 +803,8 @@ def main():
         shutil.rmtree(save_base)
     save_base.mkdir(parents=True, exist_ok=True)
 
-    print(f"{{len(images)}} 枚を処理中...")
-    results = model.predict(source="{s_images}", conf={conf}, save=False,
+    print(f"{{len(images)}} 枚を処理中... (conf={conf}, iou={iou})")
+    results = model.predict(source="{s_images}", conf={conf}, iou={iou}, save=False,
                             stream=True, verbose=False)
     rows = []
     
@@ -867,6 +936,7 @@ def build_autolabel_script(
     use_sahi: bool = False,
     tile_size: int = 640,
     tile_overlap: float = 0.2,
+    iou: float = 0.7,
 ) -> str:
     """自動アノテーション用の Python スクリプト文字列を返す。
     use_sahi=True の場合は SAHI タイル推論を使用する。"""
@@ -924,7 +994,7 @@ def main():
         exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
         images = [p for p in split_dir.iterdir() if p.suffix.lower() in exts]
         total_images += len(images)
-        print(f"\\n[{{split}}] {{len(images)}} 枚を処理中... (SAHI tile={tile_size}, overlap={tile_overlap})")
+        print(f"\\n[{{split}}] {{len(images)}} 枚を処理中... (SAHI tile={tile_size}, overlap={tile_overlap}, iou={iou})")
 
         for img_path in tqdm(images, desc=f"  {{split}}", unit="img", file=sys.stdout):
             fname = img_path.name
@@ -937,6 +1007,9 @@ def main():
                 slice_width={tile_size},
                 overlap_height_ratio={tile_overlap},
                 overlap_width_ratio={tile_overlap},
+                postprocess_type="GREEDYNMM",
+                postprocess_match_metric="IOU",
+                postprocess_match_threshold={iou},
                 verbose=0,
             )
             preds = result.object_prediction_list
@@ -1038,8 +1111,8 @@ def main():
         images = [p for p in split_dir.iterdir() if p.suffix.lower() in exts]
         total_images += len(images)
 
-        print(f"\\n[{{split}}] {{len(images)}} 枚を処理中...")
-        results = model.predict(source=str(split_dir), conf={conf},
+        print(f"\\n[{{split}}] {{len(images)}} 枚を処理中... (conf={conf}, iou={iou})")
+        results = model.predict(source=str(split_dir), conf={conf}, iou={iou},
                                 save=False, stream=True, verbose=False)
 
         for r in tqdm(results, total=len(images), desc=f"  {{split}}",
@@ -1228,6 +1301,8 @@ def create_desktop_shortcut(python_path: str = "") -> dict:
             f"        fi\n"
             f"    done\n"
             f"fi\n\n"
+            f"# Wayland プラグイン未導入環境での安定動作 (Xwayland/xcb フォールバック)\n"
+            f"export QT_QPA_PLATFORM=${{QT_QPA_PLATFORM:-\"xcb\"}}\n\n"
             f"cd \"{app_dir}\"\n"
             f"\"{py_exec}\" \"{main_py}\"\n\n"
             f"echo ''\n"

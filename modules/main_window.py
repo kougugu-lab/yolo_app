@@ -3,6 +3,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Union
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextCursor
@@ -78,7 +79,7 @@ class LabelListDialog(QDialog):
                 "Excel出力完了",
                 f"dataset フォルダ内にラベル一覧を出力しました:\n\n{xlsx_path}",
             )
-            os.startfile(xlsx_path)
+            operations.safe_open_path(xlsx_path, is_excel=True)
         except Exception as e:
             QMessageBox.warning(self, "エラー", f"Excel出力に失敗しました: {e}")
 
@@ -698,6 +699,7 @@ class MainWindow(QMainWindow):
         self._log_info(f"モデル: {model_path}")
         self._log_info(f"対象 : {self.config['dataset_dir']}")
         self._log_info(f"Conf : {self.config.get('conf_threshold', 0.25)}")
+        self._log_info(f"IoU  : {self.config.get('iou_threshold', 0.7)}")
         self._log_info("処理開始...")
 
         class_text = self.config.get("class_names", "")
@@ -711,17 +713,24 @@ class MainWindow(QMainWindow):
             use_sahi=self.config.get("use_sahi_inference", False),
             tile_size=self.config.get("tile_size", 640),
             tile_overlap=self.config.get("tile_overlap", 0.2),
+            iou=self.config.get("iou_threshold", 0.7),
         )
         worker = ScriptWorker(self.config["python_path"], script, parent=self)
         worker.finished_signal.connect(self._on_autolabel_done)
         self._start_worker(worker)
 
+    def _safe_open(self, target_path: Union[str, Path], is_excel: bool = False):
+        """OS標準のファイラー/ビューアでファイルやフォルダを開く。
+        開けない環境の場合はファイル作成のみ行い、ログにオープン中止の旨を記録する。
+        """
+        ok, msg = operations.safe_open_path(target_path, is_excel=is_excel)
+        self._log_info(msg)
+
     def _on_autolabel_done(self, success: bool, message: str):
         if success:
             xlsx_path = Path(self.config["dataset_dir"]) / "autolabel_result.xlsx"
             if xlsx_path.exists():
-                self._log_info(f"結果ファイルを開きます: {xlsx_path}")
-                os.startfile(str(xlsx_path))
+                self._safe_open(xlsx_path, is_excel=True)
 
     # ==================================================================
     # Step 5: 学習実行
@@ -757,8 +766,13 @@ class MainWindow(QMainWindow):
             self._log_info(f"キャッシュファイルを {deleted} 件削除しました")
 
         base_model = self.config.get('base_model', 'n')
-        yolo_ver = self.config.get('yolo_version', '11')
-        model_pfx = "yolo11" if yolo_ver == "11" else "yolov8"
+        yolo_ver = str(self.config.get('yolo_version', '11'))
+        if yolo_ver == "26":
+            model_pfx = "yolo26"
+        elif yolo_ver == "11":
+            model_pfx = "yolo11"
+        else:
+            model_pfx = "yolov8"
         self._log_info(f"model     : {model_pfx}{base_model}.pt")
 
         # タイル分割学習 (SAHI 対応データセット生成)
@@ -854,14 +868,14 @@ class MainWindow(QMainWindow):
             )
             self._start_worker(worker)
         else:
-            os.startfile(str(latest_run))
+            self._safe_open(latest_run)
 
     def _on_auto_ncnn_done(self, success: bool, message: str, latest_run: Path):
         if success:
             self._log_ok("NCNNモデル（ラズパイ向け軽量化モデル）の自動生成が完了しました")
         else:
             self._log_err(f"NCNNモデルの自動生成に失敗しました: {message}")
-        os.startfile(str(latest_run))
+        self._safe_open(latest_run)
 
     # ==================================================================
     # Step 6: 推論
@@ -883,6 +897,8 @@ class MainWindow(QMainWindow):
         self._log_info(f"モデル : {model_path}")
         self._log_info(f"画像   : {image_dir}")
         self._log_info(f"出力   : {output_xlsx}")
+        self._log_info(f"Conf   : {self.config.get('conf_threshold', 0.25)}")
+        self._log_info(f"IoU    : {self.config.get('iou_threshold', 0.7)}")
         self._log_info("推論開始...")
 
         script = operations.build_inference_script(
@@ -893,6 +909,7 @@ class MainWindow(QMainWindow):
             use_sahi=self.config.get("use_sahi_inference", False),
             tile_size=self.config.get("tile_size", 640),
             tile_overlap=self.config.get("tile_overlap", 0.2),
+            iou=self.config.get("iou_threshold", 0.7),
         )
         worker = ScriptWorker(self.config["python_path"], script, parent=self)
         worker.finished_signal.connect(
@@ -903,8 +920,8 @@ class MainWindow(QMainWindow):
     def _on_inference_done(self, success: bool, message: str, xlsx_path: str):
         if success:
             self._log_info(f"結果ファイル: {xlsx_path}")
-            folder = str(Path(xlsx_path).parent)
-            os.startfile(folder)
+            folder = Path(xlsx_path).parent
+            self._safe_open(folder)
 
 
 # ======================================================================
