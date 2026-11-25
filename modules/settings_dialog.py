@@ -123,17 +123,11 @@ class SettingsDialog(QDialog):
             tooltip="学習データ（train/val）や設定ファイルが保存される中心となるフォルダです。"
         )
         self.dataset_edit.textChanged.connect(self._on_dataset_dir_changed)
-        self.autolabel_model_edit = self._path_row(
-            path_layout, "自動アノテーション用モデル (.pt):", 
+        self.model_edit = self._path_row(
+            path_layout, "推論 / 自動アノテーション用モデル (.pt):", 
             file_mode=True, 
             file_filter="YOLO Model (*.pt);;All (*)",
-            tooltip="ステップ3の「自動アノテーション」で使用する学習済みモデルファイルです。"
-        )
-        self.inference_model_edit = self._path_row(
-            path_layout, "推論用モデル (.pt):", 
-            file_mode=True, 
-            file_filter="YOLO Model (*.pt);;All (*)",
-            tooltip="ステップ6の「推論」で使用するモデルファイルです。ステップ5の学習完了時に自動更新されます。"
+            tooltip="ステップ3の「自動アノテーション」とステップ6の「推論」で共通して使用するモデルファイルです。学習完了時に自動更新されます。"
         )
         self.python_edit = self._path_row(
             path_layout, "Python 実行パス:", 
@@ -422,10 +416,13 @@ class SettingsDialog(QDialog):
         self.dataset_edit.setText(self.config.get("dataset_dir", ""))
         
         # 移行中などの考慮、互換性
-        inf_path = self.config.get("inference_model_path", "") or self.config.get("model_path", "")
-        auto_path = self.config.get("autolabel_model_path", "") or self.config.get("model_path", "")
-        self.inference_model_edit.setText(inf_path)
-        self.autolabel_model_edit.setText(auto_path)
+        model_path_val = (
+            self.config.get("model_path", "")
+            or self.config.get("inference_model_path", "")
+            or self.config.get("autolabel_model_path", "")
+            or ""
+        )
+        self.model_edit.setText(model_path_val)
 
         self.train_spin.setValue(self.config.get("train_count", 80))
         self.val_spin.setValue(self.config.get("val_count", 20))
@@ -473,8 +470,7 @@ class SettingsDialog(QDialog):
         return {
             "python_path": self.python_edit.text().strip(),
             "dataset_dir": self.dataset_edit.text().strip(),
-            "inference_model_path": self.inference_model_edit.text().strip(),
-            "autolabel_model_path": self.autolabel_model_edit.text().strip(),
+            "model_path": self.model_edit.text().strip(),
             "train_count": self.train_spin.value(),
             "val_count": self.val_spin.value(),
             "epochs": self.epochs_spin.value(),
@@ -529,24 +525,38 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "警告", "有効な Python パスを指定してください。")
             return
 
-        required = ["ultralytics", "pandas", "openpyxl", "labelImg", "PyQt6", "PyYAML", "onnx", "ncnn", "sahi"]
+        # labelImg はアプリ同梱版を使用するため pip チェックから除外
+        required = ["ultralytics", "pandas", "openpyxl", "PyQt6", "PyYAML", "onnx", "ncnn", "sahi", "matplotlib"]
         missing = check_packages(python_path, required)
 
-        if not missing:
-            QMessageBox.information(self, "確認", "全パッケージがインストール済みです。")
+        if missing:
+            msg = "以下のパッケージが不足しています:\n" + ", ".join(missing)
+            msg += "\n\n不足パッケージを自動インストールしますか?"
+            reply = QMessageBox.question(
+                self, "パッケージ不足", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._run_install(python_path, missing, upgrade=False)
             return
 
-        msg = "以下のパッケージが不足しています:\n" + ", ".join(missing)
-        msg += "\n\n自動インストールしますか?"
+        # 全パッケージ導入済みの場合
         reply = QMessageBox.question(
-            self, "パッケージ不足", msg,
+            self,
+            "確認・最新化",
+            "必要な基本パッケージはすべてインストールされています。\n\n"
+            "AI検知エンジン（ultralytics）を最新バージョンにアップグレード（最新化）しますか？\n"
+            "※YOLO26 など最新モデルの利用には ultralytics の更新が必要になる場合があります。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self._run_install(python_path, missing)
+            self._run_install(python_path, ["ultralytics"], upgrade=True)
+        else:
+            QMessageBox.information(self, "確認", "全パッケージがインストール済みです。")
 
-    def _run_install(self, python_path: str, packages: list):
-        self._install_worker = InstallWorker(python_path, packages, parent=self)
+    def _run_install(self, python_path: str, packages: list, upgrade: bool = False):
+        self._install_worker = InstallWorker(python_path, packages, upgrade=upgrade, parent=self)
         if self.log_callback:
             self._install_worker.log_signal.connect(self.log_callback)
         self._install_worker.finished_signal.connect(self._on_install_done)

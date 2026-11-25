@@ -119,17 +119,50 @@ def split_copy(
     progress_callback=None,
     cancel_check=None,
 ) -> dict:
-    """元画像からランダム抽出し、train/val フォルダへコピーする。"""
+    """元画像からランダム抽出し、train/val フォルダへコピーする。
+    画像が指定枚数より少ない場合は、ある分だけ設定比率と同じ比率でコピーする。
+    """
     src = Path(source_dir)
     all_images = [
         p for p in src.iterdir()
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     ]
+    if not all_images:
+        raise ValueError(f"コピー元のフォルダに対象となる画像ファイルが見つかりません: {source_dir}")
+
+    # 必ず整数化（小数点や文字列が渡されても確実に安全にする）
+    try:
+        train_count = int(round(float(train_count)))
+    except (ValueError, TypeError):
+        train_count = 80
+    try:
+        val_count = int(round(float(val_count)))
+    except (ValueError, TypeError):
+        val_count = 20
+
+    total_avail = len(all_images)
     total_needed = train_count + val_count
-    if len(all_images) < total_needed:
-        raise ValueError(
-            f"画像が不足しています。必要: {total_needed} 枚, 利用可能: {len(all_images)} 枚"
-        )
+    original_train = train_count
+    original_val = val_count
+    adjusted = False
+
+    if total_avail < total_needed:
+        adjusted = True
+        if total_needed > 0:
+            ratio = train_count / total_needed
+        else:
+            ratio = 0.8
+        actual_train = int(round(total_avail * ratio))
+        actual_val = int(total_avail - actual_train)
+        if total_avail >= 2:
+            if val_count > 0 and actual_val == 0:
+                actual_val = 1
+                actual_train = total_avail - 1
+            elif train_count > 0 and actual_train == 0:
+                actual_train = 1
+                actual_val = total_avail - 1
+        train_count = int(actual_train)
+        val_count = int(actual_val)
 
     random.shuffle(all_images)
     train_files = all_images[:train_count]
@@ -159,7 +192,14 @@ def split_copy(
         if progress_callback:
             progress_callback(copied_count, total_files, f.name)
 
-    return {"train": len(train_files), "val": len(val_files), "total": total_files}
+    return {
+        "train": len(train_files),
+        "val": len(val_files),
+        "total": total_files,
+        "adjusted": adjusted,
+        "requested_train": original_train,
+        "requested_val": original_val,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +611,15 @@ def main():
         torch.cuda.empty_cache()
     gc.collect()
 
-    model = YOLO("{model_name}")
+    try:
+        model = YOLO("{model_name}")
+    except Exception as e:
+        print(f"[ERROR] モデル '{model_name}' のロードに失敗しました: {{e}}")
+        if "26" in "{model_name}".lower():
+            print("[ERROR] ultralytics のバージョンが古いため、YOLO26 に対応していない可能性があります。")
+            print("[HINT] 設定画面の『パッケージ確認』から ultralytics を最新バージョンに更新（アップグレード）してください。")
+        raise SystemExit(1)
+
     try:
         results = model.train(
             data="{s_data}",
@@ -649,6 +697,250 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
+# 6. 信頼度ヒストグラム生成ヘルパー
+# ---------------------------------------------------------------------------
+HISTOGRAM_HELPER_CODE = '''
+def generate_confidence_histogram(rows, output_path, title="信頼度分布 & 統計情報"):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.font_manager as fm
+        import numpy as np
+
+        # 日本語フォント設定
+        jp_fonts = [
+            "Yu Gothic", "Meiryo", "MS Gothic", "TakaoGothic",
+            "IPAexGothic", "IPAGothic", "Noto Sans CJK JP", "VL Gothic"
+        ]
+        available_fonts = set(f.name for f in fm.fontManager.ttflist)
+        matched_font = next((f for f in jp_fonts if f in available_fonts), None)
+        if matched_font:
+            plt.rcParams["font.family"] = matched_font
+        plt.rcParams["axes.unicode_minus"] = False
+
+        # クラスごとに集計 (None または信頼度0は除外)
+        class_scores = {}
+        for r in rows:
+            cls_name = r.get("クラス名")
+            conf = float(r.get("信頼度", 0))
+            if not cls_name or cls_name == "None" or conf <= 0:
+                continue
+            if cls_name not in class_scores:
+                class_scores[cls_name] = []
+            class_scores[cls_name].append(conf)
+
+        if not class_scores:
+            fig, ax = plt.subplots(figsize=(6, 3))
+            ax.text(0.5, 0.5, "検出されたオブジェクトはありません", ha="center", va="center", fontsize=14)
+            ax.axis("off")
+            plt.tight_layout()
+            plt.savefig(str(output_path), dpi=120)
+            plt.close(fig)
+            return
+
+        n_classes = len(class_scores)
+        n_cols = min(n_classes, 4)
+        n_rows = (n_classes + 3) // 4
+
+        block_width = 4.8
+        block_height = 3.2
+        fig_w = max(6.0, block_width * n_cols)
+        fig_h = max(3.5, block_height * n_rows)
+        fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=True)
+        if title:
+            fig.suptitle(title, fontsize=14, fontweight="bold")
+
+        outer_grid = fig.add_gridspec(n_rows, n_cols)
+
+        for idx, (cls_name, scores) in enumerate(class_scores.items()):
+            row = idx // 4
+            col = idx % 4
+
+            sub_grid = outer_grid[row, col].subgridspec(1, 2, width_ratios=[1.15, 2.0], wspace=0.18)
+            ax_table = fig.add_subplot(sub_grid[0, 0])
+            ax_hist = fig.add_subplot(sub_grid[0, 1])
+
+            arr = np.array(scores)
+            n = len(arr)
+            mean_val = float(np.mean(arr))
+            median_val = float(np.median(arr))
+            max_val = float(np.max(arr))
+            min_val = float(np.min(arr))
+            std_val = float(np.std(arr, ddof=1)) if n > 1 else 0.0
+
+            table_data = [
+                ["N", f"{n}"],
+                ["平均", f"{mean_val:.3f}"],
+                ["中央値", f"{median_val:.3f}"],
+                ["MAX", f"{max_val:.3f}"],
+                ["MIN", f"{min_val:.3f}"],
+                ["標準偏差", f"{std_val:.3f}"],
+            ]
+            ax_table.axis("off")
+            tbl = ax_table.table(
+                cellText=table_data,
+                colLabels=["項目", "値"],
+                loc="center",
+                cellLoc="center"
+            )
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(8.5)
+            tbl.scale(1.0, 1.25)
+
+            for (r_idx, c_idx), cell in tbl.get_celld().items():
+                if r_idx == 0:
+                    cell.set_facecolor("#2b5b84")
+                    cell.set_text_props(color="white", weight="bold")
+                else:
+                    cell.set_facecolor("#f8f9fa" if r_idx % 2 == 1 else "#eef2f5")
+
+            bins = np.linspace(0.0, 1.0, 21)
+            ax_hist.hist(arr, bins=bins, color="#3498db", edgecolor="#21618c", alpha=0.85)
+            ax_hist.set_title(f"{cls_name} (N={n})", fontsize=10, fontweight="bold", pad=4)
+            ax_hist.set_xlim(0.0, 1.0)
+            ax_hist.set_xlabel("信頼度 (Confidence)", fontsize=8)
+            ax_hist.set_ylabel("度数 (件数)", fontsize=8)
+            ax_hist.tick_params(axis="both", which="major", labelsize=8)
+            ax_hist.grid(axis="y", linestyle="--", alpha=0.5)
+
+        total_cells = n_rows * n_cols
+        for empty_idx in range(n_classes, total_cells):
+            row = empty_idx // 4
+            col = empty_idx % 4
+            ax_empty = fig.add_subplot(outer_grid[row, col])
+            ax_empty.axis("off")
+
+        plt.savefig(str(output_path), dpi=120)
+        plt.close(fig)
+    except Exception as e:
+        print(f"ヒストグラム画像生成エラー: {e}")
+'''
+
+
+def generate_confidence_histogram(
+    rows: List[dict],
+    output_path: Union[str, Path],
+    title: str = "信頼度分布 & 統計情報",
+) -> bool:
+    """推論・自動アノテーション結果 rows からクラス別の統計表＋ヒストグラム画像を生成して保存する。"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.font_manager as fm
+        import numpy as np
+
+        jp_fonts = [
+            "Yu Gothic", "Meiryo", "MS Gothic", "TakaoGothic",
+            "IPAexGothic", "IPAGothic", "Noto Sans CJK JP", "VL Gothic"
+        ]
+        available_fonts = set(f.name for f in fm.fontManager.ttflist)
+        matched_font = next((f for f in jp_fonts if f in available_fonts), None)
+        if matched_font:
+            plt.rcParams["font.family"] = matched_font
+        plt.rcParams["axes.unicode_minus"] = False
+
+        class_scores = {}
+        for r in rows:
+            cls_name = r.get("クラス名")
+            conf = float(r.get("信頼度", 0))
+            if not cls_name or cls_name == "None" or conf <= 0:
+                continue
+            if cls_name not in class_scores:
+                class_scores[cls_name] = []
+            class_scores[cls_name].append(conf)
+
+        if not class_scores:
+            fig, ax = plt.subplots(figsize=(6, 3))
+            ax.text(0.5, 0.5, "検出されたオブジェクトはありません", ha="center", va="center", fontsize=14)
+            ax.axis("off")
+            plt.tight_layout()
+            plt.savefig(str(output_path), dpi=120)
+            plt.close(fig)
+            return True
+
+        n_classes = len(class_scores)
+        n_cols = min(n_classes, 4)
+        n_rows = (n_classes + 3) // 4
+
+        block_width = 4.8
+        block_height = 3.2
+        fig_w = max(6.0, block_width * n_cols)
+        fig_h = max(3.5, block_height * n_rows)
+        fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=True)
+        if title:
+            fig.suptitle(title, fontsize=14, fontweight="bold")
+
+        outer_grid = fig.add_gridspec(n_rows, n_cols)
+
+        for idx, (cls_name, scores) in enumerate(class_scores.items()):
+            row = idx // 4
+            col = idx % 4
+
+            sub_grid = outer_grid[row, col].subgridspec(1, 2, width_ratios=[1.15, 2.0], wspace=0.18)
+            ax_table = fig.add_subplot(sub_grid[0, 0])
+            ax_hist = fig.add_subplot(sub_grid[0, 1])
+
+            arr = np.array(scores)
+            n = len(arr)
+            mean_val = float(np.mean(arr))
+            median_val = float(np.median(arr))
+            max_val = float(np.max(arr))
+            min_val = float(np.min(arr))
+            std_val = float(np.std(arr, ddof=1)) if n > 1 else 0.0
+
+            table_data = [
+                ["N", f"{n}"],
+                ["平均", f"{mean_val:.3f}"],
+                ["中央値", f"{median_val:.3f}"],
+                ["MAX", f"{max_val:.3f}"],
+                ["MIN", f"{min_val:.3f}"],
+                ["標準偏差", f"{std_val:.3f}"],
+            ]
+            ax_table.axis("off")
+            tbl = ax_table.table(
+                cellText=table_data,
+                colLabels=["項目", "値"],
+                loc="center",
+                cellLoc="center"
+            )
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(8.5)
+            tbl.scale(1.0, 1.25)
+
+            for (r_idx, c_idx), cell in tbl.get_celld().items():
+                if r_idx == 0:
+                    cell.set_facecolor("#2b5b84")
+                    cell.set_text_props(color="white", weight="bold")
+                else:
+                    cell.set_facecolor("#f8f9fa" if r_idx % 2 == 1 else "#eef2f5")
+
+            bins = np.linspace(0.0, 1.0, 21)
+            ax_hist.hist(arr, bins=bins, color="#3498db", edgecolor="#21618c", alpha=0.85)
+            ax_hist.set_title(f"{cls_name} (N={n})", fontsize=10, fontweight="bold", pad=4)
+            ax_hist.set_xlim(0.0, 1.0)
+            ax_hist.set_xlabel("信頼度 (Confidence)", fontsize=8)
+            ax_hist.set_ylabel("度数 (件数)", fontsize=8)
+            ax_hist.tick_params(axis="both", which="major", labelsize=8)
+            ax_hist.grid(axis="y", linestyle="--", alpha=0.5)
+
+        total_cells = n_rows * n_cols
+        for empty_idx in range(n_classes, total_cells):
+            row = empty_idx // 4
+            col = empty_idx % 4
+            ax_empty = fig.add_subplot(outer_grid[row, col])
+            ax_empty.axis("off")
+
+        plt.savefig(str(output_path), dpi=120)
+        plt.close(fig)
+        return True
+    except Exception as e:
+        print(f"ヒストグラム生成エラー: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 6. 推論→Excel スクリプト文字列生成
 # ---------------------------------------------------------------------------
 def build_inference_script(
@@ -681,6 +973,8 @@ from pathlib import Path
 from tqdm import tqdm
 import sys
 import shutil
+
+{HISTOGRAM_HELPER_CODE}
 
 def main():
     from sahi import AutoDetectionModel
@@ -772,6 +1066,14 @@ def main():
     except Exception:
         pass
 
+    # 信頼度ヒストグラム画像の保存
+    try:
+        hist_png = Path("{s_xlsx}").parent / (Path("{s_xlsx}").stem + "_ヒストグラム.png")
+        generate_confidence_histogram(rows, str(hist_png), title="推論結果 信頼度分布 & 統計情報")
+        print(f"ヒストグラム画像保存先: {{hist_png}}")
+    except Exception as e:
+        print(f"ヒストグラム生成スキップ (エラー): {{e}}")
+
     print(f"\\nExcel出力完了: {s_xlsx}")
     print(f"結果画像保存先: {{save_base}}")
     print(f"処理画像数: {{len(images)}}枚, 検出総数: {{len(rows)}}個")
@@ -791,8 +1093,17 @@ from tqdm import tqdm
 import sys
 import shutil
 
+{HISTOGRAM_HELPER_CODE}
+
 def main():
-    model = YOLO("{s_model}")
+    try:
+        model = YOLO("{s_model}")
+    except Exception as e:
+        print(f"[ERROR] モデル '{s_model}' のロードに失敗しました: {{e}}")
+        if "26" in "{s_model}".lower():
+            print("[ERROR] ultralytics のバージョンが古いため、YOLO26 に対応していない可能性があります。")
+            print("[HINT] 設定画面の『パッケージ確認』から ultralytics を最新バージョンに更新（アップグレード）してください。")
+        sys.exit(1)
     exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
     image_dir = Path("{s_images}")
     images = [p for p in image_dir.iterdir() if p.suffix.lower() in exts]
@@ -844,6 +1155,14 @@ def main():
         wb.save("{s_xlsx}")
     except Exception:
         pass
+
+    # 信頼度ヒストグラム画像の保存
+    try:
+        hist_png = Path("{s_xlsx}").parent / (Path("{s_xlsx}").stem + "_ヒストグラム.png")
+        generate_confidence_histogram(rows, str(hist_png), title="推論結果 信頼度分布 & 統計情報")
+        print(f"ヒストグラム画像保存先: {{hist_png}}")
+    except Exception as e:
+        print(f"ヒストグラム生成スキップ (エラー): {{e}}")
 
     print(f"\\nExcel出力完了: {s_xlsx}")
     print(f"結果画像保存先: {{save_base}}")
@@ -955,6 +1274,8 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 
+{HISTOGRAM_HELPER_CODE}
+
 def main():
     from sahi import AutoDetectionModel
     from sahi.predict import get_sliced_prediction
@@ -1061,6 +1382,14 @@ def main():
     except Exception:
         pass
 
+    # 信頼度ヒストグラム画像の保存
+    try:
+        hist_png = dataset / "autolabel_histogram.png"
+        generate_confidence_histogram(excel_rows, str(hist_png), title="自動アノテーション 信頼度分布 & 統計情報")
+        print(f"ヒストグラム画像保存先: {{hist_png}}")
+    except Exception as e:
+        print(f"ヒストグラム生成スキップ (エラー): {{e}}")
+
     print(f"\\n=== オートラベリング完了 (SAHI) ===")
     print(f"  処理画像数: {{total_images}}")
     print(f"  Excel出力 : {{xlsx_path}}")
@@ -1081,8 +1410,17 @@ from ultralytics import YOLO
 from pathlib import Path
 from tqdm import tqdm
 
+{HISTOGRAM_HELPER_CODE}
+
 def main():
-    model = YOLO("{s_model}")
+    try:
+        model = YOLO("{s_model}")
+    except Exception as e:
+        print(f"[ERROR] モデル '{s_model}' のロードに失敗しました: {{e}}")
+        if "26" in "{s_model}".lower():
+            print("[ERROR] ultralytics のバージョンが古いため、YOLO26 に対応していない可能性があります。")
+            print("[HINT] 設定画面の『パッケージ確認』から ultralytics を最新バージョンに更新（アップグレード）してください。")
+        sys.exit(1)
     dataset = Path("{s_dataset}")
 
     splits = []
@@ -1160,6 +1498,14 @@ def main():
         wb.save(str(xlsx_path))
     except Exception:
         pass
+
+    # 信頼度ヒストグラム画像の保存
+    try:
+        hist_png = dataset / "autolabel_histogram.png"
+        generate_confidence_histogram(excel_rows, str(hist_png), title="自動アノテーション 信頼度分布 & 統計情報")
+        print(f"ヒストグラム画像保存先: {{hist_png}}")
+    except Exception as e:
+        print(f"ヒストグラム生成スキップ (エラー): {{e}}")
 
     print(f"\\n=== オートラベリング完了 ===")
     print(f"  処理画像数: {{total_images}}")

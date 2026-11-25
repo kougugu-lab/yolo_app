@@ -238,6 +238,36 @@ class ScriptWorker(QThread):
                 pass
 
 
+def is_virtual_env(python_path: str) -> bool:
+    """指定された Python パスが仮想環境（venv / virtualenv / conda）かどうか判定する。"""
+    try:
+        res = subprocess.run(
+            [python_path, "-c", "import sys; print(sys.prefix != sys.base_prefix)"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        return res.stdout.strip().lower() == "true"
+    except Exception:
+        return False
+
+
+def supports_break_system_packages(python_path: str) -> bool:
+    """指定された Python の pip が --break-system-packages をサポートしているか判定する。"""
+    try:
+        res = subprocess.run(
+            [python_path, "-m", "pip", "install", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        return "--break-system-packages" in res.stdout
+    except Exception:
+        return False
+
+
 class InstallWorker(QThread):
     """不足パッケージを pip install するワーカー。"""
 
@@ -245,20 +275,37 @@ class InstallWorker(QThread):
     finished_signal = pyqtSignal(bool, str)
     progress_signal = pyqtSignal(int)
 
-    def __init__(self, python_path: str, packages: list, parent=None):
+    def __init__(self, python_path: str, packages: list, upgrade: bool = False, parent=None):
         super().__init__(parent)
         self.python_path = python_path
         self.packages = packages
+        self.upgrade = upgrade
 
     def run(self):
         total = len(self.packages)
+        failed_packages = []
+
+        # 仮想環境かどうかの判定と追加フラグ決定 (Raspberry Pi / PEP 668 対策)
+        extra_flags = []
+        if not is_virtual_env(self.python_path):
+            extra_flags.append("--user")
+            if supports_break_system_packages(self.python_path):
+                extra_flags.append("--break-system-packages")
+            flags_str = " ".join(extra_flags)
+            self.log_signal.emit(f"[INSTALL] 非仮想環境を検出: {flags_str} を適用して安全にインストールします")
+
+        if self.upgrade:
+            extra_flags.append("--upgrade")
+
         for i, pkg in enumerate(self.packages):
-            self.log_signal.emit(f"[INSTALL] {pkg} をインストール中... ({i+1}/{total})")
+            action_desc = "アップグレード中" if self.upgrade else "インストール中"
+            self.log_signal.emit(f"[INSTALL] {pkg} を{action_desc}... ({i+1}/{total})")
             try:
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
+                cmd = [self.python_path, "-m", "pip", "install"] + extra_flags + [pkg]
                 process = subprocess.Popen(
-                    [self.python_path, "-m", "pip", "install", pkg],
+                    cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -271,13 +318,21 @@ class InstallWorker(QThread):
                     self.log_signal.emit(line.rstrip())
                 process.wait()
                 if process.returncode != 0:
-                    self.finished_signal.emit(False, f"{pkg} のインストールに失敗しました")
-                    return
+                    self.log_signal.emit(f"[ERROR] {pkg} の処理に失敗しました (終了コード: {process.returncode})")
+                    failed_packages.append(pkg)
             except Exception as e:
-                self.finished_signal.emit(False, f"エラー: {e}")
-                return
+                self.log_signal.emit(f"[ERROR] {pkg} の実行時例外: {e}")
+                failed_packages.append(pkg)
             self.progress_signal.emit(int((i + 1) / total * 100))
-        self.finished_signal.emit(True, "全パッケージのインストールが完了しました")
+
+        if failed_packages:
+            msg = f"一部パッケージの処理に失敗しました: {', '.join(failed_packages)}"
+            if sys.platform != "win32":
+                msg += "\n※Raspberry Pi / Linux 環境では、システムリポジトリ (例: sudo apt install python3-pyqt6 等) での導入もお試しください。"
+            self.finished_signal.emit(False, msg)
+        else:
+            success_msg = "パッケージのアップグレードが完了しました" if self.upgrade else "全パッケージのインストールが完了しました"
+            self.finished_signal.emit(True, success_msg)
 
 
 def check_packages(python_path: str, packages: list) -> list:
@@ -285,7 +340,6 @@ def check_packages(python_path: str, packages: list) -> list:
     不足しているパッケージ名のリストを返す。"""
     missing = []
     for pkg in packages:
-        import_name = pkg
         # パッケージ名とインポート名の対応
         name_map = {
             "ultralytics": "ultralytics",
@@ -294,6 +348,7 @@ def check_packages(python_path: str, packages: list) -> list:
             "labelImg": "labelImg",
             "PyQt6": "PyQt6",
             "PyYAML": "yaml",
+            "matplotlib": "matplotlib",
         }
         imp = name_map.get(pkg, pkg)
         try:

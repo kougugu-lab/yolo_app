@@ -8,12 +8,14 @@ from typing import Optional, Union
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -34,22 +36,57 @@ from workers import ScriptWorker, SubprocessWorker, LabelImgWorker, CopyWorker
 
 
 class LabelListDialog(QDialog):
-    """4.3 ラベル一覧確認ダイアログ (train/val識別表示 & Excel出力)"""
+    """4.3 ラベル一覧確認ダイアログ (train/val識別表示 & 絞り込みフィルター & Excel出力)"""
 
     def __init__(self, dataset_dir: str, parent=None):
         super().__init__(parent)
         self.dataset_dir = Path(dataset_dir)
         self.setWindowTitle("アノテーション・ラベル一覧確認 (train/val)")
-        self.setMinimumSize(800, 500)
+        self.setMinimumSize(850, 550)
         self._build_ui()
         self._load_data()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
+        top_row = QHBoxLayout()
         info_lbl = QLabel(f"対象データセット: {self.dataset_dir}")
         info_lbl.setStyleSheet("font-weight: bold; color: #82aaff;")
-        layout.addWidget(info_lbl)
+        top_row.addWidget(info_lbl)
+
+        top_row.addStretch()
+        self.count_lbl = QLabel("表示: 0 / 全 0 件")
+        self.count_lbl.setStyleSheet("font-weight: bold; color: #a6accd;")
+        top_row.addWidget(self.count_lbl)
+        layout.addLayout(top_row)
+
+        # 絞り込みフィルターバー
+        filter_group = QGroupBox("絞り込みフィルター")
+        filter_layout = QHBoxLayout(filter_group)
+
+        filter_layout.addWidget(QLabel("種別:"))
+        self.type_filter = QComboBox()
+        self.type_filter.addItems(["すべて", "train", "val"])
+        self.type_filter.currentIndexChanged.connect(self._apply_filter)
+        filter_layout.addWidget(self.type_filter)
+
+        filter_layout.addWidget(QLabel("アノテーション:"))
+        self.annot_filter = QComboBox()
+        self.annot_filter.addItems(["すべて", "あり", "なし"])
+        self.annot_filter.currentIndexChanged.connect(self._apply_filter)
+        filter_layout.addWidget(self.annot_filter)
+
+        filter_layout.addWidget(QLabel("検索:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("画像名またはクラス名で絞り込み...")
+        self.search_input.textChanged.connect(self._apply_filter)
+        filter_layout.addWidget(self.search_input)
+
+        clear_btn = QPushButton("条件クリア")
+        clear_btn.clicked.connect(self._clear_filter)
+        filter_layout.addWidget(clear_btn)
+
+        layout.addWidget(filter_group)
 
         self.table = QTableWidget()
         self.table.setColumnCount(5)
@@ -60,7 +97,7 @@ class LabelListDialog(QDialog):
 
         btn_row = QHBoxLayout()
 
-        excel_btn = QPushButton("  Excel ファイルを出力")
+        excel_btn = QPushButton("  Excel ファイルを出力 (全件)")
         excel_btn.clicked.connect(self._export_excel)
         btn_row.addWidget(excel_btn)
 
@@ -70,6 +107,42 @@ class LabelListDialog(QDialog):
         close_btn.clicked.connect(self.close)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
+
+    def _clear_filter(self):
+        self.type_filter.setCurrentIndex(0)
+        self.annot_filter.setCurrentIndex(0)
+        self.search_input.clear()
+        self._apply_filter()
+
+    def _apply_filter(self):
+        type_val = self.type_filter.currentText()
+        annot_val = self.annot_filter.currentText()
+        search_kw = self.search_input.text().strip().lower()
+
+        total = self.table.rowCount()
+        visible = 0
+
+        for row in range(total):
+            item_type = self.table.item(row, 0)
+            item_file = self.table.item(row, 1)
+            item_annot = self.table.item(row, 2)
+            item_cls = self.table.item(row, 4)
+
+            t_txt = item_type.text() if item_type else ""
+            f_txt = item_file.text().lower() if item_file else ""
+            a_txt = item_annot.text() if item_annot else ""
+            c_txt = item_cls.text().lower() if item_cls else ""
+
+            match_type = (type_val == "すべて" or t_txt == type_val)
+            match_annot = (annot_val == "すべて" or a_txt == annot_val)
+            match_search = (not search_kw or search_kw in f_txt or search_kw in c_txt)
+
+            should_show = match_type and match_annot and match_search
+            self.table.setRowHidden(row, not should_show)
+            if should_show:
+                visible += 1
+
+        self.count_lbl.setText(f"表示: {visible} / 全 {total} 件")
 
     def _export_excel(self):
         try:
@@ -137,6 +210,8 @@ class LabelListDialog(QDialog):
                     else:
                         item.setForeground(Qt.GlobalColor.yellow)
                 self.table.setItem(row_idx, col_idx, item)
+
+        self._apply_filter()
 
 
 class MainWindow(QMainWindow):
@@ -353,7 +428,7 @@ class MainWindow(QMainWindow):
 
         # 完了メッセージ・要約ログ・エラーログ・ヘッダーなどは絶対に進捗表示とみなさない
         non_progress_keywords = [
-            "Excel", "結果画像", "処理画像数", "Saved", "Total", "[OK]", "[NG]",
+            "Excel", "結果画像", "処理画像数", "Saved", "Total", "[OK]", "[NG]", "[WARN]", "[WARNING]",
             "[CMD]", "[SCRIPT]", "完了", "モデル", "対象", "結果ファイル", "保存先",
             "=", "枚を処理中", "完了しました", "アノテーション", "Instances", "box_loss"
         ]
@@ -400,6 +475,10 @@ class MainWindow(QMainWindow):
         self._last_log_was_progress = False
         self._log(f"  [INFO] {msg}")
 
+    def _log_warn(self, msg: str):
+        self._last_log_was_progress = False
+        self._log(f"  [WARN] {msg}")
+
     # ==================================================================
     # 設定 / ヘルプ
     # ==================================================================
@@ -420,8 +499,7 @@ class MainWindow(QMainWindow):
         labels = {
             "python_path": "Python 実行パス (設定画面)",
             "dataset_dir": "データセット保存先 (設定画面)",
-            "inference_model_path": "推論用モデル .pt (設定画面)",
-            "autolabel_model_path": "自動アノテーション用モデル .pt (設定画面)",
+            "model_path": "推論 / 自動アノテーション用モデル .pt (設定画面)",
         }
         missing = []
         for k in keys:
@@ -474,12 +552,12 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         worker.start()
 
-    def _on_worker_done(self, success: bool, message: str = ""):
+    def _on_worker_done(self, success: bool, message: Union[str, dict] = "", *args):
         if success:
-            if message:
+            if message and isinstance(message, str):
                 self._log_ok(message)
         else:
-            if message:
+            if message and isinstance(message, str):
                 self._log_err(message)
         self._set_busy(False)
 
@@ -550,6 +628,11 @@ class MainWindow(QMainWindow):
 
     def _on_copy_done(self, success: bool, result: dict, error_msg: str):
         if success:
+            if result.get("adjusted"):
+                self._log_warn(
+                    f"画像枚数が指定（計 {result.get('requested_train', 0) + result.get('requested_val', 0)} 枚）より少ないため、"
+                    f"利用可能な全 {result.get('total', 0)} 枚を設定比率に合わせて分割コピーしました。"
+                )
             self._log_ok(f"計 {result.get('total', 0)} 枚のコピーが完了しました (学習:{result.get('train', 0)}, 検証:{result.get('val', 0)})")
             self._log_ok("準備完了！ 次に「2. クラス名設定」を行ってください。")
         else:
@@ -671,7 +754,7 @@ class MainWindow(QMainWindow):
     # Step 3: 自動アノテーション
     # ==================================================================
     def _step_auto_label(self):
-        if not self._require("python_path", "dataset_dir", "autolabel_model_path"):
+        if not self._require("python_path", "dataset_dir", "model_path"):
             return
 
         # 事前確認ダイアログの表示
@@ -695,7 +778,7 @@ class MainWindow(QMainWindow):
         cleared_count = operations.clear_annotation_labels(self.config["dataset_dir"])
         self._log_ok(f"既存のアノテーションラベル ({cleared_count} 件) をクリアしました")
 
-        model_path = self.config["autolabel_model_path"]
+        model_path = self.config.get("model_path", "")
         self._log_info(f"モデル: {model_path}")
         self._log_info(f"対象 : {self.config['dataset_dir']}")
         self._log_info(f"Conf : {self.config.get('conf_threshold', 0.25)}")
@@ -728,7 +811,11 @@ class MainWindow(QMainWindow):
 
     def _on_autolabel_done(self, success: bool, message: str):
         if success:
-            xlsx_path = Path(self.config["dataset_dir"]) / "autolabel_result.xlsx"
+            dataset_dir = Path(self.config["dataset_dir"])
+            xlsx_path = dataset_dir / "autolabel_result.xlsx"
+            hist_png = dataset_dir / "autolabel_histogram.png"
+            if hist_png.exists():
+                self._log_ok(f"信頼度ヒストグラム画像を作成しました: {hist_png}")
             if xlsx_path.exists():
                 self._safe_open(xlsx_path, is_excel=True)
 
@@ -828,6 +915,8 @@ class MainWindow(QMainWindow):
             self._tile_train_dataset_dir = None
 
         if not success:
+            if str(self.config.get("yolo_version")) == "26":
+                self._log_warn("※YOLO26の実行に失敗した場合、ultralytics のバージョンが古い可能性があります。設定画面（歯車）の『パッケージ確認』から最新バージョンに更新（アップグレード）してください。")
             return
 
         runs_dir = Path.cwd() / "runs" / "detect"
@@ -849,9 +938,9 @@ class MainWindow(QMainWindow):
         best_pt = latest_run / "weights" / "best.pt"
         if best_pt.exists():
             best_path = str(best_pt).replace("\\", "/")
-            self.config["inference_model_path"] = best_path
+            self.config["model_path"] = best_path
             config_manager.save(self.config)
-            self._log_ok(f"「推論用モデル」を自動更新しました: {best_path}")
+            self._log_ok(f"「推論 / 自動アノテーション用モデル」を自動更新しました: {best_path}")
 
             # NCNN モデルの自動変換を開始
             self._log_header("NCNNモデル自動生成")
@@ -881,11 +970,11 @@ class MainWindow(QMainWindow):
     # Step 6: 推論
     # ==================================================================
     def _step_inference_excel(self):
-        if not self._require("python_path", "inference_model_path"):
+        if not self._require("python_path", "model_path"):
             return
         self._log_header("推論 (Excel出力付き)")
 
-        model_path = self.config["inference_model_path"]
+        model_path = self.config.get("model_path", "")
         image_dir = QFileDialog.getExistingDirectory(self, "推論対象の画像フォルダを選択")
         if not image_dir:
             self._log_info("キャンセルされました")
@@ -920,6 +1009,9 @@ class MainWindow(QMainWindow):
     def _on_inference_done(self, success: bool, message: str, xlsx_path: str):
         if success:
             self._log_info(f"結果ファイル: {xlsx_path}")
+            hist_png = Path(xlsx_path).parent / (Path(xlsx_path).stem + "_ヒストグラム.png")
+            if hist_png.exists():
+                self._log_ok(f"信頼度ヒストグラム画像を作成しました: {hist_png}")
             folder = Path(xlsx_path).parent
             self._safe_open(folder)
 

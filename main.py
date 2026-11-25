@@ -17,11 +17,19 @@ MODULES_DIR = Path(__file__).parent / "modules"
 sys.path.insert(0, str(MODULES_DIR))
 
 import argparse
-from PyQt6.QtGui import QGuiApplication
+from PyQt6.QtCore import qInstallMessageHandler
+from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import QApplication
 
 from main_window import MainWindow
 from styles import DARK_THEME_QSS
+
+
+def _qt_message_handler(mode, context, message):
+    """Qt 内部から出力される不要なフォント警告などをフィルタリング"""
+    if "QFont::setPointSize" in message and "Point size <= 0" in message:
+        return
+    sys.stderr.write(f"{message}\n")
 
 
 def main():
@@ -61,6 +69,13 @@ def main():
         sys.exit(labelImg_mod.main())
 
     app = QApplication(sys.argv)
+    qInstallMessageHandler(_qt_message_handler)
+
+    base_font = app.font()
+    if base_font.pointSize() <= 0:
+        base_font.setPointSize(10)
+    app.setFont(base_font)
+
     app.setStyleSheet(DARK_THEME_QSS)
     app.setApplicationName("YOLO Manager")
 

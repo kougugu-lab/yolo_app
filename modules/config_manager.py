@@ -19,8 +19,7 @@ DEFAULTS = {
     # パス設定
     "python_path": "/usr/bin/python",
     "dataset_dir": "",
-    "inference_model_path": "", # 推論 / NCNN 変換用モデル (.pt)
-    "autolabel_model_path": "", # オートラベル用モデル (.pt)
+    "model_path": "",  # 推論 / 自動アノテーション共通モデル (.pt)
     # データ分割
     "train_count": 80,
     "val_count": 20,
@@ -62,6 +61,13 @@ def load() -> dict:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             merged = {**DEFAULTS, **saved}
+            # 旧キー (inference_model_path / autolabel_model_path) の後方互換移行
+            if not merged.get("model_path"):
+                merged["model_path"] = (
+                    merged.get("inference_model_path", "")
+                    or merged.get("autolabel_model_path", "")
+                    or ""
+                )
             return merged
         except (json.JSONDecodeError, OSError):
             return dict(DEFAULTS)
@@ -77,7 +83,7 @@ def save(config: dict) -> None:
 
 def reset_params(config: dict) -> dict:
     """パス以外のパラメータのみデフォルトに戻す。"""
-    path_keys = ("python_path", "dataset_dir", "inference_model_path", "autolabel_model_path")
+    path_keys = ("python_path", "dataset_dir", "model_path")
     reset = dict(DEFAULTS)
     for k in path_keys:
         reset[k] = config.get(k, "")
